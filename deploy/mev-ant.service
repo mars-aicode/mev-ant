@@ -1,0 +1,24 @@
+[Unit]
+Description=mev-ant MEV sandwich scanner
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=mevant
+ExecStart=/usr/local/bin/mev-ant serve --config /etc/mev-ant/serve.toml
+Restart=always
+RestartSec=10
+
+# Security hardening
+ProtectSystem=strict
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET
+ProtectHome=yes
+PrivateTmp=yes
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

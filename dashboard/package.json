@@ -1,0 +1,22 @@
+{
+  "name": "dashboard",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "umi dev",
+    "build": "umi build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@ant-design/icons": "^6.2.5",
+    "@ant-design/pro-components": "^2.8.10",
+    "antd": "^6.4.3",
+    "rc-field-form": "^2.7.1",
+    "umi": "^4.6.61"
+  }
+}

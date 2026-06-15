@@ -1,0 +1,9 @@
+/target
+dashboard/node_modules/
+dashboard/dist/
+dashboard/src/.umi-production/
+.agents/
+.claude/
+.codegraph/
+.mcp.json
+skills-lock.json

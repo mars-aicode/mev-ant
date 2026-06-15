@@ -1,0 +1,11 @@
+# mev-ant configuration — copy to /etc/mev-ant/serve.toml and edit
+
+rpc_url = "http://192.168.2.180:8547"
+# Database connection (run deploy/setup-db.sh to create user + database)
+db_url = "postgres://mevant:<password>@192.168.2.185:5432/mev_ant"
+from_block = 0
+delay_blocks = 6
+api_port = 6080
+
+# Path to dashboard static files (optional — serves at /)
+dashboard_dir = "/var/lib/mev-ant/dashboard"
