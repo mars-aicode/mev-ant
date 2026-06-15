@@ -288,10 +288,11 @@ async fn run_serve(config_path: &str) -> anyhow::Result<()> {
 
     // Spawn HTTP management API
     let api_pool = pool.clone();
+    let api_provider = provider.clone();
     let api_port = cfg.api_port;
     let dashboard_dir = cfg.dashboard_dir.clone();
     tokio::spawn(async move {
-        let app = api::build_router(api_pool, dashboard_dir);
+        let app = api::build_router(api_pool, Some(api_provider), dashboard_dir);
         let addr = format!("0.0.0.0:{}", api_port);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
         tracing::info!("API listening on http://{}", addr);

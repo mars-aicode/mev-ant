@@ -12,6 +12,7 @@ export default defineConfig({
         { path: '/sandwiches/:id', component: 'SandwichDetail' },
         { path: '/attackers', component: 'Attackers', name: 'Attackers' },
         { path: '/replay', component: 'Replay', name: 'Replay' },
+        { path: '/test-check', component: 'TestCheck', name: 'Test Check' },
       ],
     },
   ],

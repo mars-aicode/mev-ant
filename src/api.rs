@@ -14,10 +14,13 @@ use tower_http::services::{ServeDir, ServeFile};
 use sqlx::Row;
 
 use crate::db;
+use crate::detector::sandwich::detect_sandwiches;
+use crate::rpc::RpcClient;
 
 #[derive(Clone)]
 pub struct ApiState {
     pub pool: PgPool,
+    pub provider: Option<RpcClient>,
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +319,124 @@ pub struct ReplayRequest {
     from_block: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Detect (test check)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DetectRequest {
+    block_number: i64,
+}
+
+#[derive(Serialize)]
+pub struct DetectedBundle {
+    id: i64,
+    block_number: i64,
+    front_tx_index: i64,
+    back_tx_index: i64,
+    victim_count: i32,
+    attacker: String,
+    funder: String,
+    executor: String,
+    initiator: String,
+    back_initiator: String,
+    target: String,
+    attacked_pool: String,
+    profit_json: String,
+    gas_cost_wei: i64,
+    coinbase_bribe: i64,
+    expense_wei: i64,
+    created_at: String,
+    front_tx_hash: String,
+    back_tx_hash: String,
+    front_transfers: String,
+    victim_transfers: String,
+    back_transfers: String,
+    victim_tx_hashes: String,
+    coinbase: String,
+}
+
+#[derive(Serialize)]
+pub struct DetectResponse {
+    bundles: Vec<DetectedBundle>,
+}
+
+fn address_hex(a: alloy::primitives::Address) -> String {
+    format!("0x{}", hex::encode(a))
+}
+
+fn b256_hex(b: alloy::primitives::B256) -> String {
+    format!("0x{}", hex::encode(b))
+}
+
+fn pool_id_hex(p: crate::models::PoolId) -> String {
+    match p {
+        crate::models::PoolId::Contract(a) => address_hex(a),
+        crate::models::PoolId::Param(id) => format!("0x{}", hex::encode(id)),
+    }
+}
+
+async fn detect(
+    State(state): State<ApiState>,
+    Query(q): Query<DetectRequest>,
+) -> Result<Json<DetectResponse>, StatusCode> {
+    let provider = state.provider.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let block_number = q.block_number.max(0) as u64;
+
+    let data = crate::rpc::fetch_block(provider, block_number)
+        .await
+        .map_err(|e| {
+            tracing::error!("detect fetch_block error: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let bundles = detect_sandwiches(
+        block_number,
+        &data.flows,
+        &data.raw_logs,
+        data.coinbase,
+        crate::DEFAULT_BLACKLIST,
+        crate::DEFAULT_TOKENS,
+    );
+
+    let detected: Vec<DetectedBundle> = bundles.into_iter().enumerate().map(|(idx, b)| {
+        let profit_json = serde_json::to_string(&b.profit).unwrap_or_else(|_| "[]".to_string());
+        let front_transfers = serde_json::to_string(&b.frontrun_transfers).unwrap_or_else(|_| "[]".to_string());
+        let victim_transfers = serde_json::to_string(&b.victim_transfers).unwrap_or_else(|_| "[]".to_string());
+        let back_transfers = serde_json::to_string(&b.backrun_transfers).unwrap_or_else(|_| "[]".to_string());
+        let victim_tx_hashes = serde_json::to_string(&b.victim_tx_hashes).unwrap_or_else(|_| "[]".to_string());
+
+        DetectedBundle {
+            id: (idx + 1) as i64,
+            block_number: b.block_number as i64,
+            front_tx_index: b.front_tx_index as i64,
+            back_tx_index: b.back_tx_index as i64,
+            victim_count: b.victim_tx_indices.len() as i32,
+            attacker: address_hex(b.attacker),
+            funder: address_hex(b.funder),
+            executor: address_hex(b.executor),
+            initiator: address_hex(b.initiator),
+            back_initiator: address_hex(b.back_initiator),
+            target: address_hex(b.target),
+            attacked_pool: pool_id_hex(b.attacked_pool),
+            profit_json,
+            gas_cost_wei: b.gas_cost_wei as i64,
+            coinbase_bribe: b.coinbase_bribe as i64,
+            expense_wei: b.expense_wei as i64,
+            created_at: "".to_string(),
+            front_tx_hash: b256_hex(b.front_tx_hash),
+            back_tx_hash: b256_hex(b.back_tx_hash),
+            front_transfers,
+            victim_transfers,
+            back_transfers,
+            victim_tx_hashes,
+            coinbase: address_hex(b.coinbase),
+        }
+    }).collect();
+
+    Ok(Json(DetectResponse { bundles: detected }))
+}
+
 async fn replay(
     State(state): State<ApiState>,
     Json(body): Json<ReplayRequest>,
@@ -341,8 +462,8 @@ async fn replay(
 // Router
 // ---------------------------------------------------------------------------
 
-pub fn build_router(pool: PgPool, dashboard_dir: Option<String>) -> Router {
-    let state = ApiState { pool };
+pub fn build_router(pool: PgPool, provider: Option<RpcClient>, dashboard_dir: Option<String>) -> Router {
+    let state = ApiState { pool, provider };
 
     let mut router = Router::new()
         .route("/api/stats", get(stats))
@@ -353,6 +474,7 @@ pub fn build_router(pool: PgPool, dashboard_dir: Option<String>) -> Router {
         .route("/api/state/pause", post(pause))
         .route("/api/state/resume", post(resume))
         .route("/api/replay", post(replay))
+        .route("/api/detect", get(detect))
         .layer(
             tower_http::cors::CorsLayer::permissive()
         )

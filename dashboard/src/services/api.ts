@@ -48,6 +48,15 @@ export async function requestReplay(fromBlock: number) {
   return res.json();
 }
 
+export async function checkBlock(blockNumber: number) {
+  const res = await fetch(`${BASE}/api/detect?block_number=${blockNumber}`);
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function pauseScan() {
   await fetch(`${BASE}/api/state/pause`, { method: 'POST' });
 }

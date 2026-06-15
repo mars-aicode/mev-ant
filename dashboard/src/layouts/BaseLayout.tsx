@@ -1,6 +1,6 @@
 import { ProLayout } from '@ant-design/pro-components';
 import { Outlet, useLocation, useNavigate } from 'umi';
-import { DashboardOutlined, TableOutlined, UserOutlined, ReloadOutlined } from '@ant-design/icons';
+import { DashboardOutlined, TableOutlined, UserOutlined, ReloadOutlined, BugOutlined } from '@ant-design/icons';
 
 export default function BaseLayout() {
   const location = useLocation();
@@ -17,6 +17,7 @@ export default function BaseLayout() {
           { path: '/sandwiches', name: 'Sandwiches', icon: <TableOutlined /> },
           { path: '/attackers', name: 'Attackers', icon: <UserOutlined /> },
           { path: '/replay', name: 'Replay', icon: <ReloadOutlined /> },
+          { path: '/test-check', name: 'Test Check', icon: <BugOutlined /> },
         ],
       }}
       menuItemRender={(item, dom) => (
