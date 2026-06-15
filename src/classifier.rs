@@ -212,16 +212,20 @@ fn classify_by_fund_flow(
                     // Different tokens in vs out: a swap pool.
                     kinds.insert(addr, AddressKind::Pool);
                 } else if sent_tokens == recv_tokens {
-                    // Single token in == single token out: pure passthrough
-                    // (e.g. 1inch router forwarding ETH through itself).
-                    // Strict equality — multi-token flows (e.g. an executor
-                    // receiving ETH from WETH unwrap and sending ETH to a
-                    // router, while also receiving/sending SNX) are left
-                    // Unknown so they can be candidates for executor
-                    // discovery. Any-overlap was too loose: an executor
-                    // with one shared token gets misclassified as a
-                    // router and the executor's trade capital is hidden.
-                    kinds.insert(addr, AddressKind::Router);
+                    // Token sets match — candidate passthrough. Require
+                    // exact per-token amount equality too; otherwise the
+                    // address is keeping/spending some of the token (an
+                    // executor with wrap/route bookkeeping, not a pure
+                    // router). Block 25302239: the real executor handles
+                    // WETH, ETH and one traded token with non-zero net,
+                    // so amount inequality keeps it Unknown.
+                    let mut sent_amt: HashMap<Address, u128> = HashMap::new();
+                    let mut recv_amt: HashMap<Address, u128> = HashMap::new();
+                    for (t, a) in &sent { *sent_amt.entry(*t).or_default() += *a; }
+                    for (t, a) in &received { *recv_amt.entry(*t).or_default() += *a; }
+                    if sent_amt == recv_amt {
+                        kinds.insert(addr, AddressKind::Router);
+                    }
                 }
             }
         }

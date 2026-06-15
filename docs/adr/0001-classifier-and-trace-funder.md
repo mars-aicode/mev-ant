@@ -120,6 +120,26 @@ misclassification, and a funder that's actually a real pool would
 fail the case-5 transfer check (no inbound from a real pool to the
 executor in a normal sandwich).
 
+### Per-token amount equality for Router classification
+
+The fund-flow classifier labels an address as a Router when it sees the
+same token set flowing in and out (`sent_tokens == recv_tokens`). This
+replaced an earlier "any-overlap" heuristic that was too loose.
+
+Block 25302239 exposed that strict token-set equality is still too
+loose: the real sandwich executor handles WETH, ETH, and one traded
+token in both directions, but with non-zero net amounts (it keeps the
+trade profit). The token sets matched, so the executor was classified
+as a Router, moved into `pool_or_router`, and skipped by executor
+discovery.
+
+The refinement: after token-set equality, require **per-token amount
+equality** too (`total_sent_per_token == total_received_per_token`). A
+pure passthrough router has matching amounts for every token it
+forwards; an executor with wrap/route bookkeeping and a profit does
+not. This keeps real executors in `unknown` while still catching true
+same-token routers.
+
 ### Classifier skip of `Address::ZERO`
 
 A pre-fix bug: the zero address is the ERC20 mint/burn sentinel. Its
@@ -156,14 +176,16 @@ Adding a new regression:
 4. Add `#[tokio::test]`-free macro wrap so it auto-skips when Reth
    is down.
 
-The three current regressions (blocks 25301029, 25304912, 25300013)
-each lock in one bug class:
+The four current regressions each lock in one bug class:
 
 - **25301029** — lending address missing from `LENDING_ADDRESSES`.
 - **25304912** — dust EOA incorrectly picked as funder (case 4
   sufficiency + token-contract exclusion).
 - **25300013** — user contract misclassified as Pool; tx.target
   fallback in case 5.
+- **25302239** — real executor misclassified as Router because the
+  classifier only checked token-set equality; per-token amount equality
+  refinement keeps the executor discoverable.
 
 ## Consequences
 

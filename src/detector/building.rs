@@ -51,7 +51,6 @@ fn try_build_bundle(
     front_target: Option<Address>,
 ) -> Option<SandwichBundle> {
     if !is_reversal(front_deltas, back_deltas) { return None; }
-    // Profit
     let mut pm: HashMap<Address, i128> = HashMap::new();
     for (t, d) in front_deltas { *pm.entry(*t).or_default() += d; }
     for (t, d) in back_deltas { *pm.entry(*t).or_default() += d; }
