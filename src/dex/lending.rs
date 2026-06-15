@@ -19,6 +19,8 @@ pub static LENDING_ADDRESSES: &[Address] = &[
     address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"),
     // Aave V3 — USDC reserve proxy (flashloan provider seen in block 25301029)
     address!("98c23e9d8f34fefb1b7bd6a91b7ff122f4e16f5c"),
+    // Aave V3 — WBTC reserve proxy (flashloan provider seen in block 25300013)
+    address!("5ee5bf7ae06d1be5997a1a72006fe6c607ec6de8"),
     // Compound V2 — Comptroller
     address!("3d9819210A31b4961b30EF54bE2aeD79B9c9Cd3B"),
     // Maker DAO — Vat (core CDP engine)

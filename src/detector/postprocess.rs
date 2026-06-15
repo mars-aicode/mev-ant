@@ -145,7 +145,7 @@ fn filter_bundles(
     blacklist: &[Address],
 ) {
     bundles.retain(|b| {
-        !ctx.pool_set.contains(&b.funder) && !blacklist.contains(&b.funder)
+        !blacklist.contains(&b.funder)
     });
     for b in bundles.iter_mut() {
         let role_set: HashSet<Address> = [b.funder, b.executor, b.initiator, b.target]

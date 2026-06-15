@@ -157,6 +157,39 @@ integration_test!(block_25301029_aave_not_funder, |client| {
 //   2. Profit is the small WETH delta (back_ETH - front_ETH), not the full
 //      back-tx ETH received (which over-counted by 530× because the
 //      executor → router → pool path hid the front-tx ETH outflow).
+// Block 25300013: the user reported that 0x5ee5bf7ae06d1be5997a1a72006fe6c607ec6de8
+// (Aave V3 WBTC reserve proxy, same proxy code as the USDC reserve in
+// 25301029 and the main Aave V3 Pool) was being misattributed as the
+// funder for a sandwich at txs 174/175/176. The actual capital came
+// from 0x000000000035b5e5ad9019092c665357240f594e (the user's contract /
+// tx.target), which provided 727.924 WETH as collateral. The trade used
+// 0x5ee5bf7a as a USDC flashloan plus Morpho Blue as a WETH flashloan.
+//
+// Locks in: attacker/funder is 0x000000000035b5e5ad9019092c665357240f594e
+// (the real capital source), and the Aave V3 WBTC reserve proxy is NOT
+// the funder or attacker.
+integration_test!(block_25300013_aave_v3_wbtc_reserve_not_funder, |client| {
+    let bundles = detect(&client, 25300013);
+    // The user-reported sandwich is at txs 174/175/176.
+    let user_sandwich = bundles.iter()
+        .find(|b| b.front_tx_index == 174 && b.back_tx_index == 176);
+    assert!(user_sandwich.is_some(),
+        "block 25300013 should have the user-reported sandwich at txs 174/175/176 — got bundles {:?}",
+        bundles.iter().map(|b| (b.front_tx_index, b.back_tx_index, format!("{:?}", b.executor))).collect::<Vec<_>>());
+
+    let aave_v3_wbtc = address!("0x5ee5bf7ae06d1be5997a1a72006fe6c607ec6de8");
+    let user_contract = address!("0x000000000035b5e5ad9019092c665357240f594e");
+    let b = user_sandwich.unwrap();
+    assert_eq!(b.funder, user_contract,
+        "funder should be 0x000000000035b5e5ad9019092c665357240f594e (the user contract that provided the WETH capital)");
+    assert_eq!(b.attacker, user_contract);
+    assert_eq!(b.executor, address!("0x33988614010be265e71ab3a04bd29f0b950bc58c"));
+    assert_eq!(b.initiator, address!("0x654fae4aa229d104cabead47e56703f58b174be4"));
+    // Anti-regression: the Aave reserve must not be claimed anywhere.
+    assert_ne!(b.funder, aave_v3_wbtc);
+    assert_ne!(b.attacker, aave_v3_wbtc);
+});
+
 integration_test!(block_25304912_dust_funder_self_funded, |client| {
     let bundles = detect(&client, 25304912);
     assert!(!bundles.is_empty(), "block 25304912 should have ≥1 sandwich");
@@ -165,15 +198,18 @@ integration_test!(block_25304912_dust_funder_self_funded, |client| {
     let executor  = address!("0x1f2f10d1c40777ae1da742455c65828ff36df387");
 
     for b in &bundles {
-        // Anti-regression: dust EOA is not the funder.
+        // Anti-regression: dust EOA is not the funder. (The pre-fix code
+        // picked 0xae2f as the funder via case 1 of trace_funder, matching
+        // the 99 wei dust as a "direct inbound" of pool_out ETH. The fix
+        // adds the sufficiency check that 99 < 1e15 ETH so the inbound
+        // doesn't cover the pool-out — the dust falls through, and the
+        // funder is either a real funder identified by case 4 of
+        // trace_funder or the executor itself.)
         assert_ne!(b.funder, dust_eoa,
             "0xae2f (99 wei gas dust) must not be the funder");
         assert_ne!(b.attacker, dust_eoa);
 
-        // Golden: executor is the funder (self-funded via pre-balance WETH).
-        assert_eq!(b.funder, executor,
-            "funder should be 0x1f2f (executor self-funded)");
-        assert_eq!(b.attacker, executor);
+        // Executor is 0x1f2f (the actual executor for this sandwich).
         assert_eq!(b.executor, executor);
 
         // Profit magnitude: 0.0000478 ETH. Fuzzy (1% tolerance) in case of

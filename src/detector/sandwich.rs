@@ -231,7 +231,7 @@ mod tests {
             transfer(executor, pool, w, 1_132_767_764_829_940_199), // 1.13 WETH
             transfer(pool, executor, u, 1_888_328_466), // 1888 USDT
         ]);
-        let ctx = Ctx { block_number: 0, tx_flows: &[], pool_set: &ps, lending_set: &HashSet::new(), unknown: &unk, coinbase: Address::ZERO, supported_tokens: &[] };
+        let ctx = Ctx { block_number: 0, tx_flows: &[], pool_set: &ps, lending_set: &HashSet::new(), unknown: &unk, coinbase: Address::ZERO, supported_tokens: &[w] };
         assert_eq!(trace_funder(&ctx, &ff, executor), None);
     }
 
@@ -392,7 +392,12 @@ mod tests {
             transfer(executor, pool, eth, 1_000_000_000_000_000), // pool-out (same)
             transfer(pool, executor, token_back, 1_000_000),
         ]);
-        let ctx = Ctx { block_number: 0, tx_flows: &[], pool_set: &ps, lending_set: &HashSet::new(), unknown: &unk, coinbase: Address::ZERO, supported_tokens: &[] };
+        // supported_tokens includes both ETH sentinel and WETH contract
+        // (0xc02aaa39) so case 4 recognises the unwrap sender as a token
+        // contract and recognises ETH as the executor's outbound token
+        // (so the dust sender's ETH doesn't match → rejected).
+        let supported = [eth, weth_contract];
+        let ctx = Ctx { block_number: 0, tx_flows: &[], pool_set: &ps, lending_set: &HashSet::new(), unknown: &unk, coinbase: Address::ZERO, supported_tokens: &supported };
         assert_eq!(trace_funder(&ctx, &ff, executor), None);
     }
 
@@ -427,7 +432,12 @@ mod tests {
             transfer(router, pool, eth, 1_000_000_000_000_000), // router → pool
             transfer(pool, executor, token_back, 1_000_000),
         ]);
-        let ctx = Ctx { block_number: 0, tx_flows: &[], pool_set: &ps, lending_set: &HashSet::new(), unknown: &unk, coinbase: Address::ZERO, supported_tokens: &[] };
+        // supported_tokens includes both ETH sentinel and WETH contract
+        // (0xc02aaa39) so case 4 recognises the unwrap sender as a token
+        // contract and recognises ETH as the executor's outbound token
+        // (so the dust sender's ETH doesn't match → rejected).
+        let supported = [eth, weth_contract];
+        let ctx = Ctx { block_number: 0, tx_flows: &[], pool_set: &ps, lending_set: &HashSet::new(), unknown: &unk, coinbase: Address::ZERO, supported_tokens: &supported };
         assert_eq!(trace_funder(&ctx, &ff, executor), None);
     }
 

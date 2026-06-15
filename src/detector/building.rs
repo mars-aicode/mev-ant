@@ -64,12 +64,26 @@ fn try_build_bundle(
     let ff = ctx.tx_flows.iter().find(|f| f.tx_index == front_tx)?;
     let bf = ctx.tx_flows.iter().find(|f| f.tx_index == back_tx)?;
     let funder = funder_hint.or_else(|| trace_funder(ctx, ff, executor)).unwrap_or(executor);
-    // Flashloan: self-funded executor round-trips same token to same address
+    // Flashloan guard: when the funder is the executor (self-funded /
+    // unknown), a same-token round-trip in the front tx is only a
+    // flashloan if the counterparty is a non-pool actor. Round-trips
+    // with a pool (e.g. executor→pool X→executor in a normal swap) are
+    // not flashloans — they're the trade itself. The previous build
+    // flagged any (to, token) match, which dropped legitimate
+    // sandwiches like block 25300013 where the executor cbBTC↔pool
+    // round-trip is the trade itself, not a flashloan.
     if funder == executor {
         let senders: HashSet<(Address, Address)> = ff.transfers.iter()
-            .filter(|t| t.to == executor).map(|t| (t.from, t.token)).collect();
+            .filter(|t| t.to == executor
+                && !ctx.pool_set.contains(&t.from)
+                && t.from != Address::ZERO)
+            .map(|t| (t.from, t.token))
+            .collect();
         let repays_same = ff.transfers.iter().any(|t|
-            t.from == executor && senders.contains(&(t.to, t.token)));
+            t.from == executor
+            && !ctx.pool_set.contains(&t.to)
+            && t.to != Address::ZERO
+            && senders.contains(&(t.to, t.token)));
         if repays_same { return None; }
     }
     let attacker = funder;
@@ -216,6 +230,44 @@ pub(crate) fn trace_funder(ctx: &Ctx, ff: &TxFlow, executor: Address) -> Option<
         }
     }
 
+    // Case 4: real-capital inbound. Cases 1-3 only look at inbound of the
+    // pool_out token (the executor's swap output). They miss the case
+    // where the real capital is on a *different* token — e.g. a flashloan
+    // sandwich where the executor receives WETH from a user contract as
+    // collateral, borrows USDC from Aave, and trades USDC. The WETH is
+    // the actual at-risk capital, but cases 1-3 only see the USDC
+    // flashloan. Look at all inbound to the executor from non-pool,
+    // non-lending, non-zero sources; the largest by amount is the most
+    // likely "real capital" funder. Skip pool_out_tokens to avoid
+    // double-counting (the pool_out inbound is already handled by case 1).
+    if let Some(f) = resolve_real_capital_funder(ctx, ff, executor, ctx.supported_tokens, &pool_out_tokens) {
+        if !is_round_trip_inbound(ff, executor, f) { return Some(f); }
+    }
+
+    // Case 5: tx.target as funder. The front tx's `to` is the destination
+    // the EOA calls — typically the user's own contract that orchestrates
+    // the sandwich. This contract holds the WETH and forwards it to the
+    // executor, then receives the executor's returns. It may have been
+    // misclassified as a Pool by the fund-flow classifier (if the back tx
+    // shows it returning WETH and paying an ETH bribe — disjoint tokens,
+    // which the disjoint-token branch labels as a swap pool). The pool_set
+    // check is intentionally not used: a misclassified-as-Pool user
+    // contract is exactly the case this branch is trying to recover.
+    // Lending platforms are still excluded so Aave / Morpho reserve
+    // proxies don't get tagged as "user contracts".
+    if let Some(target) = ff.to {
+        if !ctx.lending_set.contains(&target)
+            && target != Address::ZERO
+            && target != executor
+        {
+            let provided = ff.transfers.iter()
+                .any(|t| t.from == target && t.to == executor);
+            if provided {
+                return Some(target);
+            }
+        }
+    }
+
     None
 }
 
@@ -309,6 +361,96 @@ fn resolve_eth_inbound(ctx: &Ctx, ff: &TxFlow, executor: Address) -> Option<Addr
             && ctx.unknown.contains(&t.from))
         .max_by_key(|t| amount_u128(t.amount))
         .map(|t| t.from)
+}
+
+/// Case 4: real-capital inbound — the executor received some non-pool_out
+/// token from an address that isn't a known pool, lending platform, or
+/// infra. This catches the "flashloan sandwich" pattern where the executor
+/// trades a flashloaned token (e.g. USDC from Aave) but the actual at-risk
+/// capital is on a *different* token (e.g. WETH from a user contract used
+/// as collateral). Case 1 only looks at inbound of the pool_out token, so it
+/// misses this. The largest such inbound is the most likely real funder.
+///
+/// Sufficiency is checked *partially*: the inbound must be non-zero, but it
+/// doesn't need to cover the full executor outbound of the same token. In
+/// practice the executor's outbound often includes a flashloan component
+/// (e.g. executor sent 16630 WETH to aToken: 15903 of it is a Morpho
+/// flashloan return, 728 is the user's real capital re-deposited). The
+/// outbound − flashloan-repay = real-capital-use, which equals the inbound.
+/// We can't easily split these without knowing which `to` is the lending
+/// flashloan-return, so we just require inbound > 0 and prefer the
+/// largest. Case 3 (borrow) still does the strict sufficiency check
+/// for the more common case of a single lending pair.
+///
+/// `pool_out_tokens` is intentionally *not* used as an exclusion. The
+/// executor may send the same token both to a real pool (the trade) and
+/// to a lending protocol (collateral deposit). Excluding the token would
+/// drop the real-capital inbound when the inbound token is also one of
+/// the outbound tokens — which is common in flashloan sandwiches.
+fn resolve_real_capital_funder(
+    ctx: &Ctx,
+    ff: &TxFlow,
+    executor: Address,
+    supported_tokens: &[Address],
+    pool_out_tokens: &[Address],
+) -> Option<Address> {
+    // The executor's outbound tokens and amounts: per supported token,
+    // total amount executor sends to pools/lending. Used both to filter
+    // dust candidates (token must match what was spent) and to enforce
+    // sufficiency (candidate inbound must cover the executor outbound
+    // in the same token, modulo flashloan tolerance).
+    let mut exec_out: HashMap<Address, u128> = HashMap::new();
+    for t in ff.transfers.iter()
+        .filter(|t| t.from == executor
+            && (ctx.pool_set.contains(&t.to) || ctx.lending_set.contains(&t.to))
+            && supported_tokens.contains(&t.token))
+    {
+        *exec_out.entry(t.token).or_default() += amount_u128(t.amount);
+    }
+    // pool_out_tokens (tokens executor sends to pools) acts as a
+    // fallback for the "what did the executor spend" question when
+    // the trace didn't capture an executor→pool transfer directly.
+    for t in pool_out_tokens {
+        exec_out.entry(*t).or_insert(0);
+    }
+    let mut best: Option<(Address, Address, u128)> = None;
+    for t in ff.transfers.iter()
+        .filter(|t| t.to == executor
+            && t.from != Address::ZERO
+            && !ctx.pool_set.contains(&t.from)
+            && !ctx.lending_set.contains(&t.from)
+            && !ctx.pool_set.contains(&t.to)
+            // Exclude token contracts (WETH, USDC, etc.). They appear as
+            // the `from` of mints/withdraws (WETH unwrap emits
+            // "WETH contract → executor" with token=ETH) but are not
+            // actual funders — they're protocol plumbing.
+            && !supported_tokens.contains(&t.from)
+            // Token must match what the executor actually spent. An
+            // initiator that sent 99 wei of ETH while the executor
+            // traded WETH is dust, not a funder.
+            && exec_out.contains_key(&t.token))
+    {
+        let inbound = amount_u128(t.amount);
+        if inbound == 0 { continue; }
+        // Sufficiency: candidate inbound must cover executor outbound
+        // in same token. Without this, 99 wei dust gets picked.
+        let spent = exec_out.get(&t.token).copied().unwrap_or(0);
+        if inbound < spent { continue; }
+        match best {
+            None => best = Some((t.from, t.token, inbound)),
+            Some((_, _, prev)) if inbound > prev => best = Some((t.from, t.token, inbound)),
+            Some(prev) => { best = Some(prev); }
+        }
+    }
+    best.map(|(from, _, _)| from)
+}
+
+/// True when the executor pays the candidate any token in the same tx
+/// (broader than the per-token is_round_trip check used by cases 1-3,
+/// because the "real capital" inbound is on a different token than the
+/// trade output).
+fn is_round_trip_inbound(ff: &TxFlow, executor: Address, candidate: Address) -> bool {
+    ff.transfers.iter().any(|t| t.from == executor && t.to == candidate)
 }
 
 /// Case 3: the executor sent some token C to a lending platform L and
