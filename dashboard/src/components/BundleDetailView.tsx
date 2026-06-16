@@ -25,6 +25,7 @@ interface BundleData {
   gas_cost_wei?: number | string;
   coinbase_bribe?: number | string;
   expense_wei?: number | string;
+  pure_profit_wei?: number | string;
   created_at?: string;
   front_tx_hash?: string;
   back_tx_hash?: string;
@@ -142,6 +143,13 @@ export default function BundleDetailView({ data }: { data: BundleData }) {
           <Descriptions.Item label="Gas Cost">{data.gas_cost_wei != null ? formatEth(data.gas_cost_wei) : '-'}</Descriptions.Item>
           <Descriptions.Item label="Coinbase Bribe">{data.coinbase_bribe != null ? formatEth(data.coinbase_bribe) : '-'}</Descriptions.Item>
           <Descriptions.Item label="Expense">{data.expense_wei != null ? formatEth(data.expense_wei) : '-'}</Descriptions.Item>
+          <Descriptions.Item label="Pure Profit">
+            {data.pure_profit_wei != null ? (
+              <span style={{ color: Number(data.pure_profit_wei) >= 0 ? '#3f8600' : '#cf1322' }}>
+                {formatEth(data.pure_profit_wei)}
+              </span>
+            ) : '-'}
+          </Descriptions.Item>
           {data.created_at ? <Descriptions.Item label="Scanned" span={2}>{data.created_at}</Descriptions.Item> : null}
         </Descriptions>
       </Card>

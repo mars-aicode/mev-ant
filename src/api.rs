@@ -222,6 +222,7 @@ pub struct SandwichDetail {
     gas_cost_wei: i64,
     coinbase_bribe: i64,
     expense_wei: i64,
+    pure_profit_wei: i64,
     created_at: String,
     front_tx_hash: String,
     back_tx_hash: String,
@@ -234,6 +235,37 @@ pub struct SandwichDetail {
 
 fn hex_or_empty(bytes: Option<&[u8]>) -> String {
     bytes.map(|b| format!("0x{}", hex::encode(b))).unwrap_or_default()
+}
+
+const WETH: alloy::primitives::Address = alloy::primitives::Address::new(hex_literal::hex!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"));
+const ETH: alloy::primitives::Address = crate::models::ETH_TRANSFER_ADDR;
+
+/// Compute "pure profit" in wei: gross WETH/ETH profit minus total attacker
+/// expense (gas + bribes). ETH-denominated because cost is always ETH and
+/// WETH unwraps 1:1. Returns signed i64 (may be negative for loss-making
+/// sandwiches).
+fn pure_profit_wei(profit_json: &str, expense_wei: i64) -> i64 {
+    #[derive(serde::Deserialize)]
+    struct ProfitItem {
+        token: String,
+        amount: String,
+    }
+    let items: Vec<ProfitItem> = serde_json::from_str(profit_json).unwrap_or_default();
+    let mut gross: i128 = 0;
+    for item in items {
+        let token = item.token.to_lowercase();
+        if token != format!("0x{}", hex::encode(WETH)).to_lowercase()
+            && token != format!("0x{}", hex::encode(ETH)).to_lowercase()
+        {
+            continue;
+        }
+        // amount is a signed decimal string (I256 serializes as decimal)
+        let sign = if item.amount.starts_with('-') { -1 } else { 1 };
+        let digits = item.amount.trim_start_matches('-');
+        let value: i128 = digits.parse().unwrap_or(0);
+        gross += sign * value;
+    }
+    gross.saturating_sub(expense_wei as i128) as i64
 }
 
 async fn sandwich_detail(
@@ -275,6 +307,7 @@ async fn sandwich_detail(
         gas_cost_wei: row.get(13),
         coinbase_bribe: row.get(14),
         expense_wei: row.get(15),
+        pure_profit_wei: pure_profit_wei(row.get::<String, _>(12).as_str(), row.get(15)),
         created_at: row.get::<chrono::DateTime<chrono::Utc>, _>(16).format("%Y-%m-%d %H:%M:%S").to_string(),
         front_tx_hash: hex_or_empty(row.get::<Option<Vec<u8>>, _>(17).as_deref()),
         back_tx_hash: hex_or_empty(row.get::<Option<Vec<u8>>, _>(18).as_deref()),
@@ -346,6 +379,7 @@ pub struct DetectedBundle {
     gas_cost_wei: i64,
     coinbase_bribe: i64,
     expense_wei: i64,
+    pure_profit_wei: i64,
     created_at: String,
     front_tx_hash: String,
     back_tx_hash: String,
@@ -405,6 +439,7 @@ async fn detect(
         let victim_transfers = serde_json::to_string(&b.victim_transfers).unwrap_or_else(|_| "[]".to_string());
         let back_transfers = serde_json::to_string(&b.backrun_transfers).unwrap_or_else(|_| "[]".to_string());
         let victim_tx_hashes = serde_json::to_string(&b.victim_tx_hashes).unwrap_or_else(|_| "[]".to_string());
+        let pure_profit = pure_profit_wei(&profit_json, b.expense_wei as i64);
 
         DetectedBundle {
             id: (idx + 1) as i64,
@@ -423,6 +458,7 @@ async fn detect(
             gas_cost_wei: b.gas_cost_wei as i64,
             coinbase_bribe: b.coinbase_bribe as i64,
             expense_wei: b.expense_wei as i64,
+            pure_profit_wei: pure_profit,
             created_at: "".to_string(),
             front_tx_hash: b256_hex(b.front_tx_hash),
             back_tx_hash: b256_hex(b.back_tx_hash),
