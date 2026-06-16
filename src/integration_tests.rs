@@ -218,6 +218,37 @@ integration_test!(block_25302239_executor_not_router, |client| {
     assert_eq!(b.victim_tx_indices.len(), 1, "there should be exactly one victim tx (tx 1)");
 });
 
+// Block 25305868: the front executor trades through a multi-token pool
+// (Balancer) and the victim swaps a different token pair on the same pool.
+// The old victim-direction check required the victim's net token delta sign
+// to match the front executor's net token delta sign; because the front's
+// net delta for the victim's received token was zero (it was used as a
+// routing hop), the victim was rejected and the sandwich at txs 0/1/2 was
+// missed. The fix adds a gross-direction check: victim is valid if it
+// receives a token the front sold to the pool, or sends a token the front
+// bought from the pool.
+integration_test!(block_25305868_multi_token_pool_victim, |client| {
+    let bundles = detect(&client, 25305868);
+    assert!(!bundles.is_empty(), "block 25305868 should have ≥1 sandwich");
+
+    let expected_exec = address!("0x0906a879ea0f66e3559f11b25b866dba247f9e63");
+    let expected_funder = address!("0x01fdc48ba0903bb1ae7c517c9287d88ea236f8e1");
+
+    let sandwich = bundles.iter()
+        .find(|b| b.front_tx_index == 0 && b.back_tx_index == 2);
+    assert!(sandwich.is_some(),
+        "block 25305868 should have a sandwich at txs 0/1/2 — got bundles {:?}",
+        bundles.iter().map(|b| (b.front_tx_index, b.back_tx_index)).collect::<Vec<_>>());
+
+    let b = sandwich.unwrap();
+    assert_eq!(b.executor, expected_exec,
+        "executor should be 0x0906a879... (the real pool-touching executor)");
+    assert_eq!(b.funder, expected_funder,
+        "funder should be the WETH wrapper that fronted the capital");
+    assert_eq!(b.attacker, expected_funder);
+    assert_eq!(b.victim_tx_indices.len(), 1, "there should be exactly one victim tx (tx 1)");
+});
+
 integration_test!(block_25304912_dust_funder_self_funded, |client| {
     let bundles = detect(&client, 25304912);
     assert!(!bundles.is_empty(), "block 25304912 should have ≥1 sandwich");

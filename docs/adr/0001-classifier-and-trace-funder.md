@@ -140,6 +140,27 @@ forwards; an executor with wrap/route bookkeeping and a profit does
 not. This keeps real executors in `unknown` while still catching true
 same-token routers.
 
+### Victim direction: net + gross check
+
+A victim must trade on the same pool as the front executor and in the
+same price-moving direction. The original check required the victim's
+net token delta sign to match the front executor's net token delta sign
+for at least one token. This works for two-token Uniswap-style pools
+where front and victim swap the same pair.
+
+Block 25305868 showed that multi-token pools (Balancer/Curve) break
+this assumption: the front executor sold token A and bought token B,
+while the victim swapped token C for token B. The front's net delta for
+token B happened to be zero because token B was also used as a routing
+hop inside the same batch, so the net-sign check rejected the victim.
+
+The fix keeps the net-sign check and adds a gross-direction fallback:
+a victim is valid if it receives a token the front executor sold to the
+pool, or sends a token the front executor bought from the pool. This
+captures multi-token pool victims without loosening the rule so much
+that unrelated same-pool swaps get flagged (they still need to share a
+pool and touch a token the front moved).
+
 ### Classifier skip of `Address::ZERO`
 
 A pre-fix bug: the zero address is the ERC20 mint/burn sentinel. Its
@@ -176,7 +197,7 @@ Adding a new regression:
 4. Add `#[tokio::test]`-free macro wrap so it auto-skips when Reth
    is down.
 
-The four current regressions each lock in one bug class:
+The five current regressions each lock in one bug class:
 
 - **25301029** — lending address missing from `LENDING_ADDRESSES`.
 - **25304912** — dust EOA incorrectly picked as funder (case 4
@@ -186,6 +207,10 @@ The four current regressions each lock in one bug class:
 - **25302239** — real executor misclassified as Router because the
   classifier only checked token-set equality; per-token amount equality
   refinement keeps the executor discoverable.
+- **25305868** — multi-token pool victim rejected because the
+  victim-direction check only looked at net token deltas; gross-direction
+  fallback catches victims that trade a different token pair on the same
+  pool.
 
 ## Consequences
 

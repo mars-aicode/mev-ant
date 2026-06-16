@@ -58,7 +58,10 @@ fn try_build_bundle(
         .filter(|(t, n)| *n > 0 && is_sup(*t, ctx.supported_tokens))
         .map(|(token, net)| TokenDelta { token, amount: I256::from_raw(U256::from(net as u128)) })
         .collect();
-    if profit.is_empty() { return None; }
+    if profit.is_empty() {
+        if ctx.block_number == 25305868 { eprintln!("  -> profit empty"); }
+        return None;
+    }
 
     let ff = ctx.tx_flows.iter().find(|f| f.tx_index == front_tx)?;
     let bf = ctx.tx_flows.iter().find(|f| f.tx_index == back_tx)?;
@@ -100,9 +103,32 @@ fn try_build_bundle(
             }
             if va.is_empty() { return true; }
             if !share_pool(ctx, front_tx, v) { return false; }
-            va.values().any(|ad| {
+            // Net-direction check: victim moves a token in the same direction
+            // as the front executor's net delta (e.g. victim buys what front
+            // bought). This works for simple two-token pools.
+            let net_match = va.values().any(|ad| {
                 ad.iter().any(|(tok, d)| {
                     d.signum() != 0 && front_deltas.get(tok).is_some_and(|fd| fd.signum() == d.signum())
+                })
+            });
+            if net_match { return true; }
+            // Gross-direction check for multi-token pools (Balancer/Curve):
+            // victim is affected if it receives a token the front sold to the
+            // pool, or sends a token the front bought from the pool. Block
+            // 25305868: front sells 0x6c3ea903... to the pool, victim buys the
+            // same token from the pool — net front delta for that token is 0
+            // because it is also used as a routing hop, so the net check misses.
+            let front_sold: HashSet<Address> = ff.transfers.iter()
+                .filter(|t| t.from == executor && ctx.pool_set.contains(&t.to))
+                .map(|t| t.token)
+                .collect();
+            let front_bought: HashSet<Address> = ff.transfers.iter()
+                .filter(|t| t.to == executor && ctx.pool_set.contains(&t.from))
+                .map(|t| t.token)
+                .collect();
+            va.values().any(|ad| {
+                ad.iter().any(|(tok, d)| {
+                    (*d > 0 && front_sold.contains(tok)) || (*d < 0 && front_bought.contains(tok))
                 })
             })
         })
