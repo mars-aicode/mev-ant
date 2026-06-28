@@ -529,13 +529,16 @@ impl LiquidPoolService {
         to: Address,
         amount: Option<alloy::primitives::U256>,
         max_hops: usize,
+        sort_mode: crate::pools::types::RouteSortMode,
     ) -> anyhow::Result<RouteListResponse> {
         let pools = db::get_all_pools_with_snapshots(&self.db).await?;
         let graph = TokenGraph::new(pools);
-        let routes = find_routes(&graph, from, to, max_hops, amount);
+        let mut routes = find_routes(&graph, from, to, max_hops, amount);
+        crate::pools::routing::sort_routes(&mut routes, sort_mode);
         Ok(RouteListResponse {
             from: format!("{:?}", from),
             to: format!("{:?}", to),
+            sort: serde_json::to_value(sort_mode).unwrap_or_default(),
             routes: routes.into_iter().map(route_to_dto).collect(),
         })
     }
@@ -595,6 +598,7 @@ pub struct TrackedPoolRow {
 pub struct RouteListResponse {
     pub from: String,
     pub to: String,
+    pub sort: serde_json::Value,
     pub routes: Vec<RouteDto>,
 }
 

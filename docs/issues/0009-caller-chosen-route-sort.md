@@ -8,21 +8,19 @@ routes. The current implementation uses a fixed sort policy
 caller's use case.
 
 ## Acceptance Criteria
-- [ ] `GET /api/routes` accepts a `sort` query parameter with values
+- [x] `GET /api/routes` accepts a `sort` query parameter with values
       `output | fee | tvl | confidence | hops` (default `output` to
       preserve current behaviour).
-- [ ] `RouteService` (or equivalent) threads the sort mode through to
-      `find_routes`. The pathfinder returns an unsorted `Vec<Route>`,
-      and a new `sort_routes` helper applies the chosen comparator.
-- [ ] The default mode (`output`) matches the B-variant behaviour shipped
+- [x] The pathfinder returns an unsorted `Vec<Route>`,
+      and `sort_routes` applies the chosen comparator.
+- [x] The default mode (`output`) matches the B-variant behaviour shipped
       in Issue 0008's follow-up: `output (desc) > fee (asc) > TVL (desc)
-      > confidence (desc) > hops (asc)`.
-- [ ] Each sort mode is unit-tested in `src/pools/routing.rs::tests`:
+      > confidence (asc) > hops (asc)`.
+- [x] Each sort mode is unit-tested in `src/pools/routing.rs::tests`:
       pick a graph with 2–3 routes whose sort keys differ, assert the
       chosen mode produces the documented order.
-- [ ] Add `?sort=` to `RouteListResponse` as a reflected field (or a
-      top-level `sort` field on the response) so callers can confirm
-      what they got.
+- [x] `RouteListResponse` includes a reflected `sort` field so callers
+      can confirm the mode used.
 - [ ] Update the `Route` glossary entry to list the available modes
       (or split "Route" into "Route" and "Route Sort Mode").
 - [ ] Update `docs/failure-modes.md` with a "bad sort key" failure mode

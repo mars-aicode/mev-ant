@@ -1,12 +1,13 @@
 //! Multi-hop route discovery.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use alloy::primitives::{Address, U256};
 
 use crate::pools::graph::{Edge, TokenGraph};
 use crate::pools::quoting::quote_exact_output;
-use crate::pools::types::{QuoteConfidence, Route};
+use crate::pools::types::{QuoteConfidence, Route, RouteSortMode};
 
 /// Intermediate-token whitelist for V1.
 const INTERMEDIATE_WHITELIST: &[Address] = &[
@@ -26,6 +27,7 @@ fn is_intermediate_allowed(token: Address) -> bool {
 }
 
 /// Find all simple routes from `from` to `to` with at most `max_hops` hops.
+/// Routes are sorted by the default (Output) mode.
 pub fn find_routes(
     graph: &TokenGraph,
     from: Address,
@@ -39,23 +41,37 @@ pub fn find_routes(
     visited.insert(from);
 
     dfs(graph, from, to, max_hops, &mut path, &mut visited, &mut routes, amount_in);
+    sort_routes(&mut routes, RouteSortMode::default());
+    routes
+}
 
-    // Rank: total output (desc), then total fee (asc), then min pool TVL (desc),
-    // then quote confidence (desc, Exact > Estimated), then hop count (asc).
-    // `None` total_output sorts after every `Some(_)`, so routes that couldn't
-    // be quoted land at the bottom of the list.
+/// Sort routes by a caller-chosen primary key, falling back to the B-variant
+/// order (output > fee > TVL > confidence > hops) for secondary comparison.
+pub fn sort_routes(routes: &mut Vec<Route>, mode: RouteSortMode) {
     routes.sort_by(|a, b| {
-        b.total_output.cmp(&a.total_output)
+        primary_cmp(a, b, mode)
+            .then_with(|| b.total_output.cmp(&a.total_output))
             .then_with(|| a.total_fee_bps.cmp(&b.total_fee_bps))
             .then_with(|| {
                 b.min_pool_tvl_usd
                     .partial_cmp(&a.min_pool_tvl_usd)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .unwrap_or(Ordering::Equal)
             })
-            .then_with(|| b.quote_confidence.cmp(&a.quote_confidence))
+            .then_with(|| a.quote_confidence.cmp(&b.quote_confidence))
             .then_with(|| a.hop_count.cmp(&b.hop_count))
     });
-    routes
+}
+
+fn primary_cmp(a: &Route, b: &Route, mode: RouteSortMode) -> Ordering {
+    match mode {
+        RouteSortMode::Output => b.total_output.cmp(&a.total_output),
+        RouteSortMode::Fee => a.total_fee_bps.cmp(&b.total_fee_bps),
+        RouteSortMode::Tvl => b.min_pool_tvl_usd
+            .partial_cmp(&a.min_pool_tvl_usd)
+            .unwrap_or(Ordering::Equal),
+        RouteSortMode::Confidence => a.quote_confidence.cmp(&b.quote_confidence),
+        RouteSortMode::Hops => a.hop_count.cmp(&b.hop_count),
+    }
 }
 
 fn dfs(
@@ -114,6 +130,7 @@ fn build_route(path: &[Edge], amount_in: Option<U256>) -> Option<Route> {
     let (total_output, quote_confidence) = if let Some(amount_in) = amount_in {
         let mut amount = amount_in;
         let mut all_exact = true;
+        let mut has_output = true;
         for edge in path {
             if let Some(out) = quote_exact_output(&edge.pool, &edge.state, edge.token_in, amount) {
                 amount = out;
@@ -121,11 +138,13 @@ fn build_route(path: &[Edge], amount_in: Option<U256>) -> Option<Route> {
                     all_exact = false;
                 }
             } else {
-                return None;
+                all_exact = false;
+                has_output = false;
+                break;
             }
         }
         (
-            Some(amount),
+            if has_output { Some(amount) } else { None },
             if all_exact {
                 QuoteConfidence::Exact
             } else {
@@ -292,6 +311,40 @@ mod tests {
         // (no quote attempt) and mark it as estimated.
         let graph = TokenGraph::new(vec![(pool, state)]);
         let routes = find_routes(&graph, weth, usdc, 3, None);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].quote_confidence, QuoteConfidence::Estimated);
+        assert!(routes[0].total_output.is_none());
+    }
+
+    #[test]
+    fn fluid_pool_survives_with_amount_in() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let pool = Pool {
+            address: address!("0000000000000000000000000000000000000001"),
+            pool_id: B256::ZERO,
+            kind: PoolKind::Fluid,
+            factory: None,
+            token0: weth,
+            token0_decimals: 18,
+            token1: usdc,
+            token1_decimals: 6,
+            fee: Some(0),
+            block_created: None,
+        };
+        let state = PoolSnapshot {
+            address: pool.address,
+            pool_id: B256::ZERO,
+            observed_at_block: 0,
+            reserve0: None,
+            reserve1: None,
+            tvl_usd: None,
+            state: serde_json::json!({}),
+        };
+        // With amount_in, a Fluid pool that can't quote should NOT be
+        // dropped — it should survive as Estimated with no output.
+        let graph = TokenGraph::new(vec![(pool, state)]);
+        let routes = find_routes(&graph, weth, usdc, 3, Some(U256::from(1_000_000_000u128)));
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].quote_confidence, QuoteConfidence::Estimated);
         assert!(routes[0].total_output.is_none());
@@ -490,5 +543,125 @@ mod tests {
             first.total_fee_bps,
             second.total_fee_bps
         );
+    }
+
+    #[test]
+    fn sort_by_fee_lower_first() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let low_fee = Pool {
+            address: address!("000000000000000000000000000000000000000a"),
+            pool_id: B256::ZERO,
+            kind: PoolKind::UniswapV2,
+            factory: None,
+            token0: weth,
+            token0_decimals: 18,
+            token1: usdc,
+            token1_decimals: 6,
+            fee: Some(30),
+            block_created: None,
+        };
+        let high_fee = Pool {
+            address: address!("000000000000000000000000000000000000000b"),
+            pool_id: B256::ZERO,
+            kind: PoolKind::UniswapV2,
+            factory: None,
+            token0: weth,
+            token0_decimals: 18,
+            token1: usdc,
+            token1_decimals: 6,
+            fee: Some(100),
+            block_created: None,
+        };
+        let state = PoolSnapshot {
+            address: Address::ZERO,
+            pool_id: B256::ZERO,
+            observed_at_block: 0,
+            reserve0: Some(U256::from(1000)),
+            reserve1: Some(U256::from(1000)),
+            tvl_usd: Some(1_000_000.0),
+            state: serde_json::json!({}),
+        };
+        let mut low_state = state.clone(); low_state.address = low_fee.address;
+        let mut high_state = state.clone(); high_state.address = high_fee.address;
+        let graph = TokenGraph::new(vec![(low_fee, low_state), (high_fee, high_state)]);
+        let mut routes = find_routes(&graph, weth, usdc, 3, None);
+        // Default (Output) sort — output is equal (no amount_in), tie-break by fee.
+        // Both have None output so output comparison is Equal; fee sorts ascending.
+        assert_eq!(routes.len(), 2);
+        assert!(routes[0].total_fee_bps <= routes[1].total_fee_bps);
+
+        // Fee-priority sort — lower fee ranks first regardless of other keys.
+        sort_routes(&mut routes, RouteSortMode::Fee);
+        assert_eq!(routes[0].total_fee_bps, 30);
+        assert_eq!(routes[1].total_fee_bps, 100);
+    }
+
+    #[test]
+    fn sort_by_tvl_higher_first() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let low_tvl = mk_pool(weth, usdc, 100_000.0);
+        let high_tvl = mk_pool(weth, usdc, 1_000_000.0);
+        let graph = TokenGraph::new(vec![low_tvl, high_tvl]);
+        let mut routes = find_routes(&graph, weth, usdc, 3, None);
+        assert_eq!(routes.len(), 2);
+        sort_routes(&mut routes, RouteSortMode::Tvl);
+        assert!(routes[0].min_pool_tvl_usd >= routes[1].min_pool_tvl_usd,
+            "Tvl sort: higher TVL should rank first");
+    }
+
+    #[test]
+    fn sort_by_confidence_exact_first() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        // Exact pool (UniV2)
+        let exact_pool = mk_pool(weth, usdc, 1_000_000.0);
+        // Estimated pool (Fluid, no quoter) — same token pair, different address
+        let est = (Pool {
+            address: address!("00000000000000000000000000000000000000fe"),
+            pool_id: B256::ZERO,
+            kind: PoolKind::Fluid,
+            factory: None,
+            token0: weth,
+            token0_decimals: 18,
+            token1: usdc,
+            token1_decimals: 6,
+            fee: Some(0),
+            block_created: None,
+        }, PoolSnapshot {
+            address: address!("00000000000000000000000000000000000000fe"),
+            pool_id: B256::ZERO,
+            observed_at_block: 0,
+            reserve0: None,
+            reserve1: None,
+            tvl_usd: Some(1_000_000.0),
+            state: serde_json::json!({}),
+        });
+        let graph = TokenGraph::new(vec![exact_pool, est]);
+        // Supply amount_in so the exact pool computes output (Exact) while
+        // the Fluid pool cannot quote (Estimated).
+        let mut routes = find_routes(&graph, weth, usdc, 3, Some(U256::from(1_000_000_000u128)));
+        assert_eq!(routes.len(), 2);
+        sort_routes(&mut routes, RouteSortMode::Confidence);
+        assert_eq!(routes[0].quote_confidence, QuoteConfidence::Exact);
+        assert_eq!(routes[1].quote_confidence, QuoteConfidence::Estimated);
+    }
+
+    #[test]
+    fn sort_by_hops_fewer_first() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let dai = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
+        let graph = TokenGraph::new(vec![
+            mk_pool(weth, usdc, 1_000_000.0),
+            mk_pool(weth, dai, 500_000.0),
+            mk_pool_with_kind(dai, usdc, 500_000.0, PoolKind::UniswapV2),
+        ]);
+        let mut routes = find_routes(&graph, weth, usdc, 3, None);
+        assert!(routes.len() >= 2, "expected at least 2 routes");
+        sort_routes(&mut routes, RouteSortMode::Hops);
+        assert!(routes[0].hop_count <= routes[1].hop_count,
+            "Hops sort: fewer hops should rank first");
     }
 }

@@ -158,3 +158,20 @@ pub enum QuoteConfidence {
     Exact,
     Estimated,
 }
+
+/// Sort key for `GET /api/routes?sort=<mode>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteSortMode {
+    Output,
+    Fee,
+    Tvl,
+    Confidence,
+    Hops,
+}
+
+impl Default for RouteSortMode {
+    fn default() -> Self {
+        Self::Output
+    }
+}

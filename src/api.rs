@@ -223,8 +223,16 @@ async fn routes(
     let amount = q.amount.as_deref()
         .and_then(|s| s.parse::<alloy::primitives::U256>().ok());
     let max_hops = q.max_hops.unwrap_or(3).clamp(1, 4) as usize;
+    let sort_mode = match q.sort.as_deref() {
+        None | Some("output") => crate::pools::types::RouteSortMode::Output,
+        Some("fee") => crate::pools::types::RouteSortMode::Fee,
+        Some("tvl") => crate::pools::types::RouteSortMode::Tvl,
+        Some("confidence") => crate::pools::types::RouteSortMode::Confidence,
+        Some("hops") => crate::pools::types::RouteSortMode::Hops,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
 
-    state.liquid_pool_service.find_routes(from, to, amount, max_hops)
+    state.liquid_pool_service.find_routes(from, to, amount, max_hops, sort_mode)
         .await
         .map(Json)
         .map_err(|e| {
@@ -258,6 +266,8 @@ struct RouteQuery {
     to: String,
     amount: Option<String>,
     max_hops: Option<i64>,
+    /// Sort mode: output (default), fee, tvl, confidence, hops.
+    sort: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

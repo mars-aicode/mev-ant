@@ -23,8 +23,11 @@ May differ from initiator. May equal executor when self-funded.
 _Avoid_: searcher, bot, bundler, EOA
 
 **Initiator**:
-The EOA (tx.from) that relays a transaction. Front and back may have different
-initiators when paired by same target. Recorded as `initiator` and `back_initiator`.
+The EOA (`tx.from`) of the frontrun transaction. Recorded as `initiator`.
+The backrun may have a different `tx.from`, recorded as `back_initiator`.
+The two transactions are tied together by sharing the same funder (attacker),
+regardless of whether their targets match. A mismatch between `initiator`
+and `back_initiator` does not disqualify a sandwich bundle.
 _Avoid_: worker, sender, relay, EOA
 
 **Funder**:
@@ -59,6 +62,7 @@ entry/exit in a multi-hop trade. Recorded on the sandwich bundle as
 `auxiliary_pools`. Distinct from a Liquid Pool: an Auxiliary Pool is
 attacker-only and not necessarily large, whereas a Liquid Pool is any
 top-1,000-by-TVL DEX pool regardless of whether a sandwich touched it.
+(NOT YET IMPLEMENTED — always empty in current detector output.)
 _Avoid_: liquidity pool (collides with the registry term), routing pool
 
 **Liquid Pool**:
@@ -126,31 +130,55 @@ token pass-through). Not a pool — identified by fund-flow analysis in classifi
 _Avoid_: aggregator
 
 **Lending Market**:
-A deposit/borrow market in a lending protocol (e.g., Aave, Compound). Distinct
-from a Liquid Pool: depositing collateral locks one token while borrowing
-another creates an obligation, not a final swap. Tracked separately for
-liquidation and collateral-swap MEV strategies, not included in the V1 routing
-graph.
+A deposit/borrow market in a lending protocol (e.g., Aave, Compound). Two roles:
+
+- **Detection**: Used in funder resolution to distinguish borrow/repay actions from
+  direct capital provision. Tokens sent TO the executor from a lending protocol
+  represent a borrow, not a funder; tokens sent FROM the executor to a lending
+  protocol represent a repay or deposit, not a pool-out. Without `lending_set`,
+  the funder resolver would misattribute Aave/Compound as the capital source.
+- **Routing**: NOT included in the V1 routing graph. Deposit/borrow creates a debt
+  obligation rather than a final swap. Tracked separately for liquidation and
+  collateral-swap MEV strategies in a future version.
+
+Distinct from a Liquid Pool.
 _Avoid_: reserve pool, lending pool
+
+**Liquidity Job**:
+A background task spawned by `mev-ant serve` that maintains the pool registry.
+Two phases per tick:
+
+- **Incremental**: processes blocks since the last cursor, fetching pool state
+  (reserves, TVL) via `eth_call` for any pool touched by state-changing events
+  (Swap, Mint, Burn, Sync) in those blocks. Only touched pools are updated.
+- **Daily full refresh**: once per day at the configured hour, re-scans all
+  registered pools from on-chain event data to discover new pools, re-ranks
+  the top 1,000 by TVL into `liquid_pools`, and snapshots their latest state.
+
+The job tolerates RPC failures and restarts: if the DB already contains registry
+data, the job picks up from the last cursor and retries on the next tick.
+_See also_: Liquid Pool, Pool Snapshot, Bootstrap File.
+_Avoid_: refresher, background worker
 
 **Bootstrap File**:
 An optional JSON file containing a curated list of well-known pools. Read by
-`mev-ant seed-pools` before the TheGraph path runs, so the registry can be
-primed without depending on TheGraph availability. The bootstrap is additive
-(`ON CONFLICT DO NOTHING`), so re-running with an updated file is safe. The
-`version` field is a positive integer; the loader rejects unknown versions.
-The bootstrap does not bypass TheGraph — it supplements it. A daily refresh
-in the Liquidity Job still re-seeds from TheGraph to keep the registry current.
+`mev-ant seed-pools` to prime the registry without depending on on-chain event
+scanning. The bootstrap is additive (`ON CONFLICT DO NOTHING`), so re-running
+with an updated file is safe. The `version` field is a positive integer; the
+loader rejects unknown versions. The bootstrap does not bypass the Liquidity
+Job — it supplements it. A daily full refresh in the Liquidity Job still
+re-scans from on-chain event data to keep the registry current.
 _See also_: Liquid Pool, Liquidity Job.
 _Avoid_: snapshot, seed file
 
 **Pool Snapshot**:
-A point-in-time record of a pool's reserves, prices, and derived TVL. Only the
-latest snapshot per pool is retained for routing. Snapshots are produced per
-block for pools touched by state-changing events (e.g., Swap, Mint, Burn, Sync),
-with a daily full refresh of all Liquid Pools synchronized with the TheGraph
-re-seed. The `observed_at_block` field records the block at which the snapshot
-was read; the snapshot is not per-block history.
+A point-in-time record of a pool's reserves, prices, and derived TVL, fetched
+on-chain via `eth_call`. Only the latest snapshot per pool is retained for
+routing. Snapshots are produced per block for pools touched by state-changing
+events (e.g., Swap, Mint, Burn, Sync), with a daily full refresh of all Liquid
+Pools synchronised with the Liquidity Job's event re-scan. The `observed_at_block`
+field records the block at which the snapshot was read; the snapshot is not
+per-block history.
 _See also_: Pool, Liquid Pool.
 _Avoid_: reserve sample, pool state
 
@@ -172,9 +200,13 @@ Positive = received from pool, negative = paid to pool. Used for reversal matchi
 _Avoid_: flow delta, token net
 
 **Profit**:
-Aggregated multi-token net flow for supported tokens:
-Σ(back_deltas - front_deltas) for WETH, USDT, USDC, DAI, WBTC. Other tokens
-ignored. Computed per-token (front deltas summed, back deltas summed, then compared).
+Aggregated multi-token net flow for Supported Tokens:
+Σ(front_deltas + back_deltas), keeping only entries where the net is positive.
+Both front_deltas and back_deltas are signed (paying to pool = negative, receiving
+from pool = positive), so a profitable sandwich has at least one Supported Token
+where front outflows are offset by larger back inflows. Profit is a vector of
+(token, amount) pairs, one per profitable Supported Token.
+ETH and WETH are treated as a single economic unit for profit accounting.
 _Avoid_: gain, earnings
 
 **Cost**:
@@ -187,7 +219,12 @@ What block.coinbase earns from this sandwich: Σ priority fees + direct ETH brib
 _Avoid_: validator revenue, builder fee
 
 **Net**:
-Profit - Cost = attacker net gain (signed, ETH-denominated). Negative = loss.
+The WETH/ETH portion of Profit minus Cost: `net = weth_profit - expense_wei`.
+Expressed in wei (ETH-denominated). Only the WETH/ETH component is used because
+Cost is always in ETH (gas + bribes); subtracting cost from USDC or USDT profit
+would mix units. Net can be negative even when Profit has positive entries in
+non-ETH tokens. Negative = attacker lost ETH after costs, regardless of
+non-ETH token gains.
 _Avoid_: revenue, realized profit, pure profit
 
 **Victim**:
@@ -197,19 +234,22 @@ the same trade direction (pays same token, receives same token).
 _Avoid_: prey, target tx
 
 **Supported Token**:
-Tokens used for profit calculation and victim detection: WETH, USDC, USDT, DAI, WBTC.
-Victim pool involvement checks use ALL tokens from Transfer events, not just supported ones.
+Tokens used for profit calculation and victim detection: ETH, WETH, USDC, USDT, DAI, WBTC.
+ETH and WETH are treated as equivalent (WETH unwraps 1:1 to ETH). Victim pool
+involvement checks use ALL tokens from Transfer events, not just supported ones.
 _Avoid_: recognized token
 
 **Quote Confidence**:
 A label on a Route indicating whether the on-chain output can be computed
 exactly. `Exact` means every hop has a quoter that knows the math (UniV2,
 UniV3, Curve, SushiSwap, FraxSwap, PancakeSwap V3). `Estimated` means at
-least one hop uses a quoter that doesn't know the exact math (Balancer V2/V3,
-Fluid DEX in V1); the route's `total_output` is a rough estimate and may
-diverge from realised output. Routes that cannot be quoted at all
-(`total_output = None`) sort after every quoted route.
-_See also_: Route.
+least one hop uses a quoter whose output is an approximation rather than the
+pool's exact math (e.g. Balancer, Fluid, or any pool without a dedicated
+quoter); the route's `total_output` is `None` because the output cannot be
+computed from the hop that lacks a quoter. Routes that cannot be quoted at
+all (`total_output = None` because no `amount_in` was supplied) likewise
+use `Estimated` confidence.
+_See also_: Route, Route Sort Mode.
 _Avoid_: quote type, confidence level
 
 **Unit Test**:
@@ -222,54 +262,3 @@ A regression test that exercises the full sandwich-detection pipeline against a 
 Reth node on a real mainnet block. It requires `MEV_ANT_RPC_URL` (or the default RPC)
 to be reachable and fails loudly otherwise.
 _Avoid_: end-to-end test, regression test (ambiguous)
-
-## Detection Algorithm
-
-### Step 0 — Classification
-Receipt-level logs only (not internal frames). Classify addresses:
-- Swap event → Pool (overrides any prior Token classification)
-- Transfer/Approval event → Token (only if not already Pool)
-- Blacklist → Infra
-- Fund-flow analysis: same-token pass-through → Router; different-token exchange → Pool
-- Remaining → Unknown (candidates for executor/funder)
-
-Output: `pool_or_router` set, `unknown` set, `kinds` map.
-
-### Stage 1 — Filter
-Keep only txs with ≥2 Transfer events. Nonce fillers and approvals-only txs excluded.
-
-### Stage 2 — Executor Discovery
-Per filtered tx, per Unknown address:
-- Pool-involved transfers → `exec_deltas` (per-token net) + `exec_pools` (touched pools)
-- Empty-delta stubs for `tx.from`/`tx.to` if not already tracked (enables pairing by initiator/target)
-
-Output: `Vec<ExecutorTrade { tx_index, executor, deltas, pools, from, to }>`.
-
-### Stage 3 — Tx-level Pairing
-Group executor trades by tx_index. Pair txs by same initiator/target.
-Aggregate ALL executor deltas in both txs. Best executor selected by
-delta count. Handles single-executor and multi-contract patterns.
-Calls `try_build_bundle` which runs: is_consecutive, share_pool, is_reversal,
-profit aggregation, funder tracing, flashloan detection, victim identification,
-cost computation.
-
-### Stage 4 — Post-process
-- `dedup_bundles`: per (front, back), keep highest profit
-- `validate_bundles`: executor pool presence, same-pool recheck, funder consistency,
-     profit recomputation (fallback when empty), victim revalidation, transfer collection
-- `filter_bundles`: pool/funder blacklist, victim role filter, drop zero-victim bundles
-- `resolve_overlaps`: non-overlapping, highest-profit
-
-### Victim Identification
-Victims must satisfy all:
-- Tx between frontrun and backrun
-- Sender ≠ initiator, attacker, executor
-- Target ≠ front target (not attacker's own workers)
-- Trade direction matches front executor (any token)
-- Shares pool with front tx
-
-### Roles (derived)
-- **Attacker** = funder (from transfer graph)
-- **Executor** = pool-touching address (from trade signature)
-- **Initiator** = tx.from of frontrun
-- **Funder** = capital source traced from front tx transfers

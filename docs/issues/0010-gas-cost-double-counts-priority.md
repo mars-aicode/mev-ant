@@ -1,6 +1,27 @@
-# Issue 0010 — Gas cost double-counts priority fee
+# Issue 0010 — Gas cost double-counts priority fee (CLOSED — NOT A BUG)
 
-## Goal
+## Resolution
+
+The gas cost calculation in `compute_costs` is **correct**. The formula:
+```
+gas_used * (effective_gas_price + effective_priority_fee)
+```
+produces the right result because `effective_gas_price` in `TxFlow` is populated
+with `base_fee` (NOT `base_fee + priority_fee` as the field name suggests):
+
+```
+rpc.rs:160:  effective_gas_price: base_fee,   // block's baseFeePerGas
+rpc.rs:161:  effective_priority_fee: tip,     // tx's effective tip per gas
+engine.rs:431: gas_used * (base_fee + tip)    // = correct total gas cost
+```
+
+The issue was filed under the assumption that `effective_gas_price` contains the
+total effective gas price (base_fee + tip), which would double-count tip. It does not.
+
+The field naming (`effective_gas_price` vs `base_fee_per_gas`) is misleading and
+should be renamed in a future cleanup, but no calculation needs fixing.
+
+## Original goal (for reference)
 Fix a long-standing calculation bug in the sandwich detector's `Cost`
 aggregation. The total `Cost` is currently the sum of two
 overlapping expressions:
