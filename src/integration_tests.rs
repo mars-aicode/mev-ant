@@ -1,8 +1,8 @@
 //! Integration tests against a live Reth node.
 //!
 //! These tests exercise the full sandwich-detection pipeline end-to-end on
-//! real mainnet blocks. They auto-skip if no Reth is reachable — default
-//! `cargo test` is fast and never fails for "Reth is down".
+//! real mainnet blocks. They FAIL LOUDLY if no Reth is reachable. CI must
+//! provide a node at `MEV_ANT_RPC_URL` or make the default URL reachable.
 //!
 //! Run with:
 //!     cargo test integration
@@ -19,8 +19,12 @@
 use alloy::primitives::address;
 use std::sync::OnceLock;
 
-use crate::detector::sandwich::detect_sandwiches;
+use crate::classifier::DefaultClassifier;
+use crate::detector::detect_sandwiches;
 use crate::models::SandwichBundle;
+use crate::pools::lending;
+use crate::pools::quoting::{curve, univ3};
+use crate::pools::types::{CurveState, Pool, PoolKind, PoolSnapshot, V3State};
 use crate::rpc::{fetch_block, RpcClient};
 
 const DEFAULT_RPC_URL: &str = "http://192.168.2.180:8547";
@@ -36,40 +40,40 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// Returns Some(rpc_url) if integration tests should run, None if they should skip.
-fn rpc_url_if_configured() -> Option<String> {
-    std::env::var("MEV_ANT_RPC_URL")
+/// Returns the RPC URL to use for integration tests.
+///
+/// Panics if `MEV_ANT_RPC_URL` is unset/empty and the default URL is not
+/// reachable. Integration tests require a live Reth node and fail loudly
+/// when one is unavailable.
+fn rpc_url_required() -> String {
+    let url = std::env::var("MEV_ANT_RPC_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            // If unset, probe the default RPC. A short timeout makes a down
-            // Reth fail fast as a clear skip rather than a 30s test hang.
-            let host_port = DEFAULT_RPC_URL
-                .trim_start_matches("http://")
-                .trim_start_matches("https://");
-            host_port.parse().ok().and_then(|addr| {
-                std::net::TcpStream::connect_timeout(
-                    &addr,
-                    std::time::Duration::from_millis(500),
-                )
-                .ok()
-                .map(|_| DEFAULT_RPC_URL.to_string())
-            })
-        })
+        .unwrap_or_else(|| DEFAULT_RPC_URL.to_string());
+
+    // Probe the chosen RPC. A short timeout makes a down Reth fail fast
+    // rather than hanging each test for 30s.
+    let host_port = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let addr: std::net::SocketAddr = host_port
+        .parse()
+        .unwrap_or_else(|_| panic!("RPC URL {} is not a valid host:port", url));
+
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)) {
+        Ok(_) => url,
+        Err(e) => panic!(
+            "integration tests require a reachable Reth node at {} (set MEV_ANT_RPC_URL to override): {}",
+            url, e
+        ),
+    }
 }
 
 macro_rules! integration_test {
     ($name:ident, |$client:ident| $body:block) => {
         #[test]
         fn $name() {
-            let Some(url) = rpc_url_if_configured() else {
-                eprintln!(
-                    "SKIP {}: set MEV_ANT_RPC_URL or make {} reachable",
-                    stringify!($name),
-                    DEFAULT_RPC_URL
-                );
-                return;
-            };
+            let url = rpc_url_required();
             let $client = RpcClient::new(&url).expect("RPC client");
             $body
         }
@@ -81,7 +85,9 @@ fn detect(client: &RpcClient, block_number: u64) -> Vec<SandwichBundle> {
     let block = runtime()
         .block_on(fetch_block(client, block_number))
         .unwrap_or_else(|e| panic!("fetch_block({}) failed: {:?}", block_number, e));
+    let classifier = DefaultClassifier::new(crate::DEFAULT_BLACKLIST, crate::dex::lending::LENDING_ADDRESSES);
     detect_sandwiches(
+        &classifier,
         block_number,
         &block.flows,
         &block.raw_logs,
@@ -289,4 +295,265 @@ integration_test!(block_25304912_dust_funder_self_funded, |client| {
             "profit {} ETH exceeds the realistic ceiling of 0.001 ETH — over-counting regression?",
             profit_f);
     }
+});
+
+integration_test!(univ3_quote_weth_usdc, |client| {
+    // WETH/USDC 0.05% pool at a pinned block.
+    let pool_address = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+    let block = 25_300_000u64;
+    let block_tag = format!("0x{:x}", block);
+
+    let slot0_data = alloy::primitives::Bytes::from_static(&[0x38, 0x50, 0xc7, 0xbd]);
+    let liq_data = alloy::primitives::Bytes::from_static(&[0x1a, 0x68, 0x65, 0x02]);
+
+    let slot0_hex = runtime()
+        .block_on(client.call_at(pool_address, slot0_data, &block_tag))
+        .expect("slot0 call");
+    let liq_hex = runtime()
+        .block_on(client.call_at(pool_address, liq_data, &block_tag))
+        .expect("liquidity call");
+
+    let slot0_bytes = hex::decode(slot0_hex.trim_start_matches("0x")).expect("decode slot0");
+    let liq_bytes = hex::decode(liq_hex.trim_start_matches("0x")).expect("decode liquidity");
+
+    let sqrt_price_x96 = alloy::primitives::U256::from_be_slice(&slot0_bytes[0..32]);
+    let liquidity = alloy::primitives::U256::from_be_slice(&liq_bytes[0..32]);
+
+    let pool = Pool {
+        address: pool_address,
+        pool_id: alloy::primitives::B256::ZERO,
+        kind: PoolKind::UniswapV3,
+        factory: Some(crate::pools::registry::UNISWAP_V3_FACTORY),
+        token0: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        token0_decimals: 6,
+        token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+        token1_decimals: 18,
+        fee: Some(500),
+        block_created: None,
+    };
+    let state = PoolSnapshot {
+        address: pool_address,
+        pool_id: alloy::primitives::B256::ZERO,
+        observed_at_block: block,
+        reserve0: None,
+        reserve1: None,
+        tvl_usd: None,
+        state: serde_json::to_value(&V3State {
+            sqrt_price_x96,
+            tick: 0,
+            liquidity,
+            tick_spacing: 10,
+            ticks: vec![],
+        })
+        .unwrap(),
+    };
+
+    // 1,000 USDC in should yield some WETH out.
+    let amount_in = alloy::primitives::U256::from(1_000_000_000u64);
+    let out = univ3::quote(&pool, &state, pool.token0, amount_in)
+        .expect("V3 quote should succeed");
+    assert!(out > alloy::primitives::U256::ZERO, "V3 quote output should be positive");
+});
+
+integration_test!(curve_quote_frax_usdc, |client| {
+    // Curve FRAX/USDC 2-coin stableswap pool at a pinned block.
+    let pool_address = address!("DcEF968d416a41Cdac0ED8702fAC8128A64241A2");
+    let block = 25_300_000u64;
+    let block_tag = format!("0x{:x}", block);
+
+    let frax = address!("853d955aCEf822Db058eb8505911ED77F175b99e");
+    let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+    let a_sel = crate::pools::liquidity::curve_a_selector();
+    let fee_sel = crate::pools::liquidity::curve_fee_selector();
+    let bal_sel = crate::pools::liquidity::curve_balances_selector();
+
+    let a_hex = runtime()
+        .block_on(client.call_at(pool_address, alloy::primitives::Bytes::from(a_sel.0[..4].to_vec()), &block_tag))
+        .expect("A call");
+    let fee_hex = runtime()
+        .block_on(client.call_at(pool_address, alloy::primitives::Bytes::from(fee_sel.0[..4].to_vec()), &block_tag))
+        .expect("fee call");
+
+    let a = alloy::primitives::U256::from_be_slice(&hex::decode(a_hex.trim_start_matches("0x")).expect("decode A")[0..32]);
+    let fee = alloy::primitives::U256::from_be_slice(&hex::decode(fee_hex.trim_start_matches("0x")).expect("decode fee")[0..32]);
+
+    let mut balances = Vec::with_capacity(2);
+    for i in 0..2u8 {
+        let mut data = bal_sel.0[..4].to_vec();
+        data.extend_from_slice(&alloy::primitives::U256::from(i).to_be_bytes::<32>());
+        let bal_hex = runtime()
+            .block_on(client.call_at(pool_address, alloy::primitives::Bytes::from(data), &block_tag))
+            .expect(&format!("balance {} call", i));
+        let bal = alloy::primitives::U256::from_be_slice(&hex::decode(bal_hex.trim_start_matches("0x")).expect("decode balance")[0..32]);
+        balances.push(bal);
+    }
+
+    let pool = Pool {
+        address: pool_address,
+        pool_id: alloy::primitives::B256::ZERO,
+        kind: PoolKind::CurveVyper,
+        factory: Some(crate::pools::registry::CURVE_REGISTRY),
+        token0: frax,
+        token0_decimals: 18,
+        token1: usdc,
+        token1_decimals: 6,
+        fee: Some((fee.to::<u64>() / 1_000_000_000_0) as u32),
+        block_created: None,
+    };
+    let state = PoolSnapshot {
+        address: pool_address,
+        pool_id: alloy::primitives::B256::ZERO,
+        observed_at_block: block,
+        reserve0: None,
+        reserve1: None,
+        tvl_usd: None,
+        state: serde_json::to_value(&CurveState {
+            n_coins: 2,
+            a,
+            fee,
+            balances: balances.clone(),
+            coins: vec![frax, usdc],
+            decimals: vec![18, 6],
+        })
+        .unwrap(),
+    };
+
+    // 1 FRAX in -> expect roughly 1 USDC out (minus fee).
+    let amount_in = alloy::primitives::U256::from(1_000_000_000_000_000_000u128);
+    let out = curve::quote(&pool, &state, frax, usdc, amount_in)
+        .expect("Curve quote should succeed");
+    assert!(out > alloy::primitives::U256::ZERO, "Curve quote output should be positive");
+
+    // Compare against on-chain get_dy for the same input at the same block.
+    let get_dy_selector = alloy::primitives::keccak256("get_dy(int128,int128,uint256)");
+    let mut get_dy_data = get_dy_selector.0[..4].to_vec();
+    get_dy_data.extend_from_slice(&alloy::primitives::U256::from(0).to_be_bytes::<32>()); // i
+    get_dy_data.extend_from_slice(&alloy::primitives::U256::from(1).to_be_bytes::<32>()); // j
+    get_dy_data.extend_from_slice(&amount_in.to_be_bytes::<32>()); // dx
+    let dy_hex = runtime()
+        .block_on(client.call_at(pool_address, alloy::primitives::Bytes::from(get_dy_data), &block_tag))
+        .expect("get_dy call");
+    let dy = alloy::primitives::U256::from_be_slice(&hex::decode(dy_hex.trim_start_matches("0x")).expect("decode dy")[0..32]);
+
+    // Allow a small relative tolerance because our solver uses f64 internally.
+    let diff = if out > dy { out - dy } else { dy - out };
+    let tolerance = dy / alloy::primitives::U256::from(100); // 1%
+    assert!(
+        diff <= tolerance,
+        "Curve quote {} deviates from on-chain get_dy {} by more than 1%", out, dy
+    );
+});
+
+integration_test!(aave_v3_reserves_and_rates_at_25_300_000, |client| {
+    // Pin block, hit the Aave V3 Pool directly via eth_call.
+    let pool = lending::AAVE_V3_POOL;
+    let block = 25_300_000u64;
+
+    let reserves = runtime()
+        .block_on(lending::aave_v3_reserves_list(&client, pool, block))
+        .expect("getReservesList");
+    assert!(!reserves.is_empty(), "Aave V3 reserve list should be non-empty");
+    // WETH, USDC, USDT and DAI are all listed in Aave V3 mainnet.
+    let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    assert!(reserves.contains(&weth), "WETH should be in Aave V3 reserves");
+    assert!(reserves.contains(&usdc), "USDC should be in Aave V3 reserves");
+
+    // USDC always has heavy utilisation, so its borrow rate must be > 0.
+    let m = runtime()
+        .block_on(lending::aave_v3_reserve_state(&client, pool, usdc, block))
+        .expect("USDC reserve state");
+
+    assert_eq!(m.protocol_str(), "aave_v3");
+    assert_eq!(m.underlying_asset, usdc);
+    // At least the variable-borrow rate must decode from the struct.
+    assert!(m.variable_borrow_rate_ray.is_some(), "USDC variable borrow rate should decode");
+    // ray upper bound: 1e27. Anything above that is a decoding bug.
+    let ray_max = alloy::primitives::U256::from(10u64).pow(alloy::primitives::U256::from(27u64));
+    for (label, rate) in [
+        ("supply", m.supply_rate_ray),
+        ("variable", m.variable_borrow_rate_ray),
+        ("stable", m.stable_borrow_rate_ray),
+    ] {
+        if let Some(r) = rate {
+            assert!(r < ray_max, "{} borrow rate {} exceeds ray", label, r);
+        }
+    }
+});
+
+integration_test!(univ2_weth_usdc_reserves_at_25_300_000, |client| {
+    // Pin block, fetch getReserves() from a canonical UniV2 WETH/USDC pair.
+    use crate::pools::liquidity;
+    let pool = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
+    let block = 25_300_000u64;
+
+    let (r0, r1) = runtime()
+        .block_on(liquidity::fetch_univ2_reserves(&client, pool))
+        .expect("WETH/USDC reserves");
+
+    // At block 25.3M both reserves must be non-zero.
+    assert!(r0 > alloy::primitives::U256::ZERO, "reserve0 should be > 0");
+    assert!(r1 > alloy::primitives::U256::ZERO, "reserve1 should be > 0");
+    // Pool token0 = USDC (6 dec) so reserve0 should be a large value
+    // roughly comparable to ~25M USDC.
+    assert!(r0 > alloy::primitives::U256::from(1_000_000_000_000u64),
+        "USDC reserve should be > 1M, got {}", r0);
+});
+
+integration_test!(routing_finds_weth_usdc_via_known_pool, |client| {
+    // End-to-end routing: build a TokenGraph with a known live WETH/USDC
+    // pool, find routes, and verify the output amount is positive.
+    use crate::pools::graph::TokenGraph;
+    use crate::pools::liquidity;
+    use crate::pools::routing::find_routes;
+    use crate::pools::types::{Pool, PoolKind, PoolSnapshot, V3State};
+
+    let pool_addr = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"); // WETH/USDC 0.05%
+    let block = 25_300_000u64;
+    let block_tag = format!("0x{:x}", block);
+
+    // Fetch slot0 + liquidity via the helper used by the live job.
+    let (sqrt_price_x96, tick, liquidity) = runtime()
+        .block_on(liquidity::fetch_univ3_state(&client, pool_addr))
+        .expect("V3 state");
+
+    let pool = Pool {
+        address: pool_addr,
+        pool_id: alloy::primitives::B256::ZERO,
+        kind: PoolKind::UniswapV3,
+        factory: Some(crate::pools::registry::UNISWAP_V3_FACTORY),
+        token0: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+        token0_decimals: 6,
+        token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
+        token1_decimals: 18,
+        fee: Some(500),
+        block_created: None,
+    };
+    let state = PoolSnapshot {
+        address: pool_addr,
+        pool_id: alloy::primitives::B256::ZERO,
+        observed_at_block: block,
+        reserve0: None,
+        reserve1: None,
+        tvl_usd: None,
+        state: serde_json::to_value(&V3State {
+            sqrt_price_x96,
+            tick,
+            liquidity,
+            tick_spacing: 10,
+            ticks: vec![],
+        }).unwrap(),
+    };
+
+    let graph = TokenGraph::new(vec![(pool.clone(), state.clone())]);
+    // 1,000 USDC in should produce some WETH out.
+    let amount_in = alloy::primitives::U256::from(1_000_000_000u64);
+    let routes = find_routes(&graph, pool.token0, pool.token1, 3, Some(amount_in));
+    assert!(!routes.is_empty(), "should find a route from USDC to WETH");
+    let r = &routes[0];
+    assert_eq!(r.hop_count, 1);
+    assert_eq!(r.quote_confidence, crate::pools::types::QuoteConfidence::Exact);
+    let out = r.total_output.expect("exact quote produces output");
+    assert!(out > alloy::primitives::U256::ZERO, "quote output should be > 0");
 });

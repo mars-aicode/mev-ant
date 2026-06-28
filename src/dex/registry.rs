@@ -143,6 +143,15 @@ pub static DEX_REGISTRY: &[DexInfo] = &[
         event_sig: "Swap(address,address,uint256,uint256)",
         indexed_count: 2,
     },
+    // 13. Fluid DEX (LogOperate on the FluidLiquidity layer)
+    DexInfo {
+        topic0: b256!("9c01e8ae2948568e6453e97e5bbefed2a1d51cfc3d29b9754d86d476a58708ce"),
+        family: super::types::DexFamily::Fluid,
+        pool_source: PoolSource::EventAddress,
+        sender_in_event: true,
+        event_sig: "LogOperate(address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)",
+        indexed_count: 2,
+    },
 ];
 
 /// How to extract the pool identity from a swap log.
@@ -170,9 +179,8 @@ pub const BALANCER_V2_VAULT: alloy::primitives::Address =
     alloy::primitives::address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
 
 /// Uniswap V4 PoolManager address on Ethereum mainnet.
-#[allow(dead_code)]
 pub const UNISWAP_V4_POOLMANAGER: alloy::primitives::Address =
-    alloy::primitives::address!("000000000004444c5dc75Cb358380D2e08dE62B0");
+    alloy::primitives::address!("000000000004444c5dc75cB358380D2e3dE08A90");
 
 /// All known vault/manager contracts (Type B emitters).
 #[allow(dead_code)]

@@ -46,6 +46,53 @@ impl RpcClient {
         let result: String = self.request("eth_blockNumber", "").await?;
         Ok(u64::from_str_radix(result.trim_start_matches("0x"), 16)?)
     }
+
+    /// Generic RPC call with arbitrary params array.
+    async fn request_params<R: for<'de> Deserialize<'de>>(
+        &self, method: &str, params: serde_json::Value,
+    ) -> Result<R> {
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+        let resp_bytes = self.client.post(&self.url).json(&body).send().await?.bytes().await
+            .with_context(|| format!("fetch {} response", method))?;
+        let mut deserializer = serde_json::Deserializer::from_slice(&resp_bytes);
+        deserializer.disable_recursion_limit();
+        let resp: JsonRpcResponse = JsonRpcResponse::deserialize(&mut deserializer)
+            .with_context(|| format!("parse {} response", method))?;
+        if let Some(error) = resp.error {
+            anyhow::bail!("RPC error {}: {}", error.code, error.message);
+        }
+        serde_json::from_value(resp.result)
+            .with_context(|| format!("deserialize {} result", method))
+    }
+
+    /// Fetch logs matching a filter.
+    pub async fn get_logs(&self, filter: serde_json::Value) -> Result<Vec<EthLog>> {
+        self.request_params("eth_getLogs", serde_json::json!([filter])).await
+    }
+
+    /// Execute a read-only contract call at `latest`.
+    pub async fn call(&self, to: Address, data: alloy::primitives::Bytes) -> Result<String> {
+        self.call_at(to, data, "latest").await
+    }
+
+    /// Execute a read-only contract call at a specific block tag.
+    pub async fn call_at(&self, to: Address, data: alloy::primitives::Bytes, block: &str) -> Result<String> {
+        let tx = serde_json::json!({"to": to, "data": data});
+        self.request_params("eth_call", serde_json::json!([tx, block])).await
+    }
+}
+
+/// A standard Ethereum log returned by `eth_getLogs`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct EthLog {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: String,
+    pub block_number: Option<String>,
+    pub transaction_hash: Option<B256>,
+    pub log_index: Option<String>,
 }
 
 

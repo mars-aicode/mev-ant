@@ -1,9 +1,35 @@
+# —— Rust ——
 /target
+
+# —— Node / Dashboard ——
 dashboard/node_modules/
 dashboard/dist/
+dashboard/.umi/
 dashboard/src/.umi-production/
+
+# —— Config with secrets ——
+serve.toml
+.env
+.env.*
+!.env.example
+
+# —— IDE / Editor ——
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# —— Logs ——
+*.log
+logs/
+
+# —— Agent tooling (local-only) ——
 .agents/
 .claude/
 .codegraph/
+.opencode/
 .mcp.json
 skills-lock.json

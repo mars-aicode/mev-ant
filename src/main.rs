@@ -7,142 +7,24 @@ mod db;
 mod detector;
 mod dex;
 mod models;
+mod pools;
+mod repository;
 mod rpc;
+mod scanner;
+mod services;
+mod tokens;
+
+pub use tokens::{DEFAULT_BLACKLIST, DEFAULT_TOKENS};
 
 use alloy::primitives::Address;
+use anyhow::Context;
 use clap::Parser;
-use futures::stream::{self, StreamExt};
 use sqlx::Row;
 use tracing::info;
 
 use config::{Cli, Command};
-use detector::sandwich::detect_sandwiches;
-
-/// Token metadata: symbol, decimals.
-const TOKEN_META: &[(&str, alloy::primitives::Address, u8)] = &[
-    (
-        "WETH",
-        alloy::primitives::Address::new(hex_literal::hex!(
-            "C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-        )),
-        18,
-    ),
-    (
-        "USDC",
-        alloy::primitives::Address::new(hex_literal::hex!(
-            "A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-        )),
-        6,
-    ),
-    (
-        "USDT",
-        alloy::primitives::Address::new(hex_literal::hex!(
-            "dAC17F958D2ee523a2206206994597C13D831ec7"
-        )),
-        6,
-    ),
-    (
-        "DAI",
-        alloy::primitives::Address::new(hex_literal::hex!(
-            "6B175474E89094C44Da98b954EedeAC495271d0F"
-        )),
-        18,
-    ),
-    (
-        "WBTC",
-        alloy::primitives::Address::new(hex_literal::hex!(
-            "2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
-        )),
-        8,
-    ),
-    ("ETH", crate::models::ETH_TRANSFER_ADDR, 18),
-];
-
-fn format_amount(amount: &alloy::primitives::I256, token: alloy::primitives::Address) -> String {
-    let (sign, abs) = amount.into_sign_and_abs();
-    let dec = TOKEN_META
-        .iter()
-        .find(|m| m.1 == token)
-        .map(|m| m.2)
-        .unwrap_or(18);
-    let sym = TOKEN_META
-        .iter()
-        .find(|m| m.1 == token)
-        .map(|m| m.0)
-        .unwrap_or("???");
-    let prefix = if sign.is_negative() { "-" } else { "" };
-    let raw: u128 = abs.to::<u128>();
-    let div = 10u128.pow(dec as u32);
-    let int_part = raw / div;
-    let frac = raw % div;
-    format!(
-        "{}{}.{:0>width$} {}",
-        prefix,
-        int_part,
-        frac,
-        sym,
-        width = dec as usize
-    )
-}
-
-fn format_wei(wei: u128) -> String {
-    let dec = 18u32;
-    let div = 10u128.pow(dec);
-    let int_part = wei / div;
-    let frac = wei % div;
-    format!("{}.{:0>18} ETH", int_part, frac)
-}
-
-/// Default infrastructure blacklist — contracts that should never be candidates.
-pub const DEFAULT_BLACKLIST: &[alloy::primitives::Address] = &[
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "E592427A0AEce92De3Edee1F18E0157C05861564"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "000000000004444c5dc75Cb358380D2e08dE62B0"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "BA12222222228d8Ba445958a75a0704d566BF2C8"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "1111111254EEB25477B68fb85Ed929f73A960582"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "111111125421cA6dc452d289314280a0f8842A65"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "C0FFEE0000000000000000000000000000000000"
-    )),
-];
-
-/// Default supported tokens for profit calculation.
-pub const DEFAULT_TOKENS: &[alloy::primitives::Address] = &[
-    crate::models::ETH_TRANSFER_ADDR,
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "dAC17F958D2ee523a2206206994597C13D831ec7"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "6B175474E89094C44Da98b954EedeAC495271d0F"
-    )),
-    alloy::primitives::Address::new(hex_literal::hex!(
-        "2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
-    )),
-];
+use scanner::Scanner;
+use tokens::{format_amount, format_wei};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -161,40 +43,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Export(cfg) => run_export(cfg).await?,
         Command::Serve(cfg) => run_serve(&cfg.config).await?,
         Command::Replay(cfg) => run_replay(cfg).await?,
+        Command::SeedPools(cfg) => run_seed_pools(cfg).await?,
     }
 
     Ok(())
-}
-
-/// Concurrent block-scanning loop.
-async fn scan_blocks(
-    provider: &rpc::RpcClient,
-    block_range: &[u64],
-    concurrency: usize,
-) -> Vec<Result<(u64, Vec<models::SandwichBundle>), anyhow::Error>> {
-    let results: Vec<_> = stream::iter(block_range.iter().copied())
-        .map(|block_number| async move {
-            let data = rpc::fetch_block(provider, block_number).await?;
-            let bundles = detect_sandwiches(
-                block_number,
-                &data.flows,
-                &data.raw_logs,
-                data.coinbase,
-                DEFAULT_BLACKLIST,
-                DEFAULT_TOKENS,
-            );
-            Ok((block_number, bundles))
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
-    results
 }
 
 async fn run_scan(cfg: config::ScanConfig) -> anyhow::Result<()> {
     let pool = db::init_pool(&cfg.db_url).await?;
     db::migrate(&pool).await?;
     let provider = rpc::RpcClient::new(&cfg.rpc_url)?;
+    let scanner = Scanner::new(provider);
 
     let from = if cfg.resume {
         db::last_scanned_block(&pool)
@@ -213,7 +72,7 @@ async fn run_scan(cfg: config::ScanConfig) -> anyhow::Result<()> {
     let mut total_sandwiches: u64 = 0;
 
     for chunk in block_range.chunks(cfg.concurrency * 4) {
-        let results = scan_blocks(&provider, chunk, cfg.concurrency).await;
+        let results = scanner.scan_blocks(chunk, cfg.concurrency).await;
         for result in results {
             match result {
                 Ok((block_num, bundles)) => {
@@ -254,6 +113,7 @@ async fn run_replay(cfg: config::ReplayConfig) -> anyhow::Result<()> {
 
 async fn run_peek(cfg: config::PeekConfig) -> anyhow::Result<()> {
     let provider = rpc::RpcClient::new(&cfg.rpc_url)?;
+    let scanner = Scanner::new(provider);
     eprintln!(
         "peeking blocks {}..{} (concurrency={})",
         cfg.from, cfg.to, cfg.concurrency
@@ -264,7 +124,7 @@ async fn run_peek(cfg: config::PeekConfig) -> anyhow::Result<()> {
     let mut hits = 0u64;
 
     for chunk in block_range.chunks(cfg.concurrency * 4) {
-        let results = scan_blocks(&provider, chunk, cfg.concurrency).await;
+        let results = scanner.scan_blocks(chunk, cfg.concurrency).await;
         for result in results {
             match result {
                 Ok((_, bundles)) => {
@@ -413,147 +273,50 @@ async fn run_serve(config_path: &str) -> anyhow::Result<()> {
         cfg.from_block, cfg.delay_blocks
     );
 
-    loop {
-        // No transaction, no advisory lock. Each query auto-commits and
-        // is atomic on its own. The pending-replay flag and the
-        // post-fetch re-check give us eventually-consistent behavior
-        // across admin actions (pause / replay), without the cost of
-        // serializing through the DB.
-
-        // Read state.
-        let state = match db::read_scan_state(&pool).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("read_scan_state: {:?}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-
-        // Pending replay: scanner performs its own replay. If the admin
-        // endpoint set pending_replay_from, do the replay: delete data
-        // from that block, reset the cursor, clear the flag, and
-        // auto-resume if the scanner was paused. The replay operations
-        // are idempotent — if the scanner crashes mid-replay, the next
-        // iteration retries from the still-set flag.
-        if state.pending_replay_from != 0 {
-            let from = state.pending_replay_from;
-            info!("performing pending replay from block {}", from);
-            if let Err(e) = db::delete_sandwiches_from(&pool, from).await {
-                tracing::error!("delete_sandwiches_from: {:?}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-            if let Err(e) = db::delete_blocks_scanned_from(&pool, from).await {
-                tracing::error!("delete_blocks_scanned_from: {:?}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-            if let Err(e) = db::reset_scan_state_to(&pool, from).await {
-                tracing::error!("reset_scan_state_to: {:?}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-            if let Err(e) = db::clear_pending_replay_from(&pool).await {
-                tracing::error!("clear_pending_replay_from: {:?}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-            if !state.enabled {
-                info!("auto-resuming scanner due to pending replay");
-                if let Err(e) = db::set_scan_enabled(&pool, true).await {
-                    tracing::error!("set_scan_enabled: {:?}", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-            }
-            continue;
-        }
-
-        if !state.enabled {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            continue;
-        }
-        let chain_head = match provider.block_number().await {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!("block_number: {:?}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-        {
-            static LAST_HEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            if chain_head != LAST_HEAD.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Err(e) = db::update_chain_head(&pool, chain_head).await {
-                    tracing::error!("update_chain_head: {:?}", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-                LAST_HEAD.store(chain_head, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        let target = chain_head.saturating_sub(cfg.delay_blocks as u64);
-        if state.next_block > target {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            continue;
-        }
-        let block_to_scan = state.next_block;
-
-        // Fetch (no DB).
-        let data = match rpc::fetch_block(&provider, block_to_scan).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!("fetch_block {}: {:?}", block_to_scan, e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-        let bundles = detector::sandwich::detect_sandwiches(
-            block_to_scan,
-            &data.flows,
-            &data.raw_logs,
-            data.coinbase,
-            DEFAULT_BLACKLIST,
-            DEFAULT_TOKENS,
+    if cfg.liquidity_enabled {
+        let job_provider = rpc::RpcClient::new(&cfg.rpc_url)?;
+        let job_db = pool.clone();
+        let job_top_n = cfg.liquidity_top_n;
+        let job_poll = cfg.liquidity_poll_interval_secs;
+        let job_hour = cfg.liquidity_full_refresh_hour;
+        let lending_enabled = cfg.lending_enabled;
+        tokio::spawn(async move {
+            let job = crate::pools::job::LiquidityJob::with_options(
+                job_provider, job_db, job_top_n, job_poll, job_hour, lending_enabled,
+            );
+            job.run(None).await;
+        });
+        info!(
+            "liquidity job spawned (top_n={}, poll={}s, refresh_hour={} UTC, lending={})",
+            job_top_n, job_poll, job_hour, lending_enabled
         );
-
-        // Re-check state and write. If admin's pending replay fired
-        // during the fetch, the flag will be set now — let the next
-        // iteration handle it, skip the writes for the stale block.
-        // (The detected bundles are discarded; the next scan re-detects.)
-        let state = match db::read_scan_state(&pool).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("read_scan_state (post-fetch): {:?}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-        if state.pending_replay_from != 0 || !state.enabled || state.next_block != block_to_scan {
-            continue;
-        }
-        let count = bundles.len();
-        if !bundles.is_empty() {
-            if let Err(e) = db::insert_sandwiches(&pool, &bundles).await {
-                tracing::error!("insert_sandwiches: {:?}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-        }
-        if let Err(e) = db::mark_block_scanned(&pool, block_to_scan, count).await {
-            tracing::error!("mark_block_scanned: {:?}", e);
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            continue;
-        }
-        if let Err(e) = db::advance_scan_state(&pool, block_to_scan + 1).await {
-            tracing::error!("advance_scan_state: {:?}", e);
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            continue;
-        }
-
-        info!("block {} scanned: {} sandwiches", block_to_scan, count);
     }
+
+    let scanner = Scanner::new(provider);
+    scanner.run_continuous(&pool, cfg.delay_blocks as u64).await
+}
+
+async fn run_seed_pools(cfg: config::SeedPoolsConfig) -> anyhow::Result<()> {
+    let pool = db::init_pool(&cfg.db_url).await?;
+    db::migrate(&pool).await?;
+    let provider = rpc::RpcClient::new(&cfg.rpc_url)?;
+
+    if let Some(path) = cfg.bootstrap.as_ref() {
+        let bootstrap_pools = crate::pools::bootstrap::load_bootstrap(path)
+            .with_context(|| format!("load bootstrap from {}", path.display()))?;
+        db::insert_pools(&pool, &bootstrap_pools).await?;
+        tracing::info!(
+            "bootstrap inserted {} pools from {}",
+            bootstrap_pools.len(),
+            path.display()
+        );
+    }
+
+    crate::pools::registry::refresh_liquid_pools(&provider, &pool, cfg.top_n)
+        .await
+        .context("refresh liquid pools")?;
+
+    Ok(())
 }
 
 #[cfg(test)]

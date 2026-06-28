@@ -36,4 +36,5 @@ pub enum DexFamily {
     Ekubo,
     LiquidityBook,
     Solidly,
+    Fluid,
 }

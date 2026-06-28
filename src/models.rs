@@ -71,7 +71,7 @@ pub struct SandwichBundle {
     pub victim_tx_indices: Vec<u64>,
     pub victim_tx_hashes: Vec<B256>,
     pub attacked_pool: PoolId,
-    pub liquidity_pools: Vec<PoolId>,
+    pub auxiliary_pools: Vec<PoolId>,
     pub attacker: Address,
     pub frontrun_transfers: Vec<Transfer>,
     pub victim_transfers: Vec<Transfer>,
