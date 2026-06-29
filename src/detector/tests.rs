@@ -400,7 +400,6 @@ fn try_build_bundle_router_passthrough_profit() {
 
 #[test]
 fn discover_trades_skips_failed_tx() {
-    use crate::classifier::{Classified, Classifier};
     use crate::detector::engine::discover_executor_trades;
 
     let weth = weth();
@@ -434,15 +433,6 @@ fn discover_trades_skips_failed_tx() {
     assert_eq!(flows[0].tx_index, 1);
 
     let unknown: HashSet<Address> = [initiator, executor].into_iter().collect();
-    let classified = Classified {
-        kinds: std::collections::HashMap::new(),
-        pool_or_router: ps.clone(),
-        pools: HashSet::new(),
-        tx_pools: vec![],
-        tokens: HashSet::new(),
-        lending_set: HashSet::new(),
-        unknown: unknown.clone(),
-    };
 
     let ctx = Ctx {
         block_number: 0,
@@ -455,7 +445,7 @@ fn discover_trades_skips_failed_tx() {
         supported_tokens: &[weth, usdc()],
     };
 
-    let trades = discover_executor_trades(&ctx, &flows, &classified);
+    let trades = discover_executor_trades(&ctx, &flows);
     // No trade should reference the failed tx (index 0).
     // discover_executor_trades only processes `flows`, which excludes
     // failed txs, so index 1+ trades may exist but 0 must not.

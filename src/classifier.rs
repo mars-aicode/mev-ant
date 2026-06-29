@@ -413,6 +413,33 @@ mod tests {
     }
 
     #[test]
+    fn fund_flow_eth_sender_classified_as_pool_by_flow() {
+        // Fund-flow analysis classifies ETH senders as Pool
+        // (WETH→ETH exchange pattern = different tokens).
+        // The DETECTOR layer (detect_sandwiches) cleans this up
+        // by demoting coinbase-ETH senders back to Unknown,
+        // because a DEX pool never sends ETH to the block's coinbase.
+        let funder = addr("0xaaaa");
+        let executor = addr("0xbbbb");
+        let coinbase = addr("0xcccc");
+        let weth = addr("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        let eth = crate::models::ETH_TRANSFER_ADDR;
+
+        let txs = vec![mock_tx(0, vec![
+            transfer(funder, executor, weth, 100),
+        ]), mock_tx(1, vec![
+            transfer(executor, funder, weth, 105),
+            transfer(funder, coinbase, eth, 1),
+        ])];
+        let logs: Vec<Vec<crate::rpc::DxgLog>> = vec![vec![], vec![]];
+
+        let c = classifier().classify(&txs, &logs);
+        // Fund-flow still classifies as Pool — this is expected.
+        // The detector layer's cleanup will handle it.
+        assert!(c.pool_or_router.contains(&funder));
+    }
+
+    #[test]
     fn zero_address_skipped_as_router() {
         let token = addr("0x9999");
         let user = addr("0xaaaa");

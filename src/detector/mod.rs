@@ -50,6 +50,39 @@ pub fn detect_sandwiches<C: crate::classifier::Classifier>(
 ) -> Vec<SandwichBundle> {
     let classified = classifier.classify(tx_flows, raw_logs);
 
+    // Post-classification: the fund-flow heuristic may classify funder
+    // contracts as Pool when they receive WETH (profit) and send ETH
+    // (coinbase bribe) in the same tx — different tokens = Pool pattern.
+    // Demote such addresses from pool_or_router back to unknown so the
+    // detector doesn't treat funder→coinbase ETH transfers as pool
+    // interactions (which would cancel the executor's pool profit).
+    //
+    // Only demote addresses that BOTH (a) send ETH to coinbase AND
+    // (b) never emitted a swap event — a real DEX pool always has at
+    // least one Swap/Mint/Burn event whose topic0 matches the registry.
+    // Fund-flow-only pools (no swap events) that send ETH to coinbase
+    // are funders, not pools.
+    let mut pool_or_router = classified.pool_or_router.clone();
+    let mut unknown = classified.unknown.clone();
+    let eth = crate::models::ETH_TRANSFER_ADDR;
+    let swap_event_pools: HashSet<Address> = classified.pools.iter()
+        .filter_map(|p| match p {
+            PoolId::Contract(a) => Some(*a),
+            PoolId::Param(_) => None,
+        })
+        .collect();
+    for flow in tx_flows {
+        for t in &flow.transfers {
+            if t.token == eth && t.to == coinbase {
+                if !swap_event_pools.contains(&t.from) {
+                    if pool_or_router.remove(&t.from) {
+                        unknown.insert(t.from);
+                    }
+                }
+            }
+        }
+    }
+
     // Exclude reverted transactions: their trace-captured transfers
     // never materialised on chain and would produce phantom profit.
     let flows: Vec<&TxFlow> = tx_flows.iter()
@@ -58,9 +91,9 @@ pub fn detect_sandwiches<C: crate::classifier::Classifier>(
     if flows.len() < 2 { return vec![]; }
     debug!("block {}: {} txs after filter ({} total)", block_number, flows.len(), tx_flows.len());
 
-    let pool_set = &classified.pool_or_router;
+    let pool_set = &pool_or_router;
     let lending_set = &classified.lending_set;
-    let unknown = &classified.unknown;
+    let unknown_set = &unknown;
 
     // Augment swap-event-derived pool identities with transfer-derived pools.
     // This keeps detection robust when swap logs live in internal call frames
@@ -71,10 +104,10 @@ pub fn detect_sandwiches<C: crate::classifier::Classifier>(
             tx_pools.push(HashSet::new());
         }
         for t in &flow.transfers {
-            if classified.pool_or_router.contains(&t.from) {
+            if pool_or_router.contains(&t.from) {
                 tx_pools[tx_idx].insert(PoolId::Contract(t.from));
             }
-            if classified.pool_or_router.contains(&t.to) {
+            if pool_or_router.contains(&t.to) {
                 tx_pools[tx_idx].insert(PoolId::Contract(t.to));
             }
         }
@@ -86,12 +119,12 @@ pub fn detect_sandwiches<C: crate::classifier::Classifier>(
         pool_set,
         tx_pools,
         lending_set,
-        unknown,
+        unknown: unknown_set,
         coinbase,
         supported_tokens,
     };
 
-    let trades = engine::discover_executor_trades(&ctx, &flows, &classified);
+    let trades = engine::discover_executor_trades(&ctx, &flows);
     let bundles = engine::pair_trades(&ctx, trades);
 
     debug!("block {}: {} bundles after pairing", block_number, bundles.len());

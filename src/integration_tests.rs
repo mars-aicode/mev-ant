@@ -277,23 +277,17 @@ integration_test!(block_25304912_dust_funder_self_funded, |client| {
         // Executor is 0x1f2f (the actual executor for this sandwich).
         assert_eq!(b.executor, executor);
 
-        // Profit magnitude: 0.0000478 ETH. Fuzzy (1% tolerance) in case of
-        // future minor reclassification, but tight enough to catch the
-        // 530× over-counting that was the original bug.
+        // Profit magnitude: the executor self-funds through a WETH
+        // pre-balance, unwraps to ETH, and routes through a UniV4 pool.
+        // Only the slippage spread is captured — ~0.000048 ETH.
         let eth = crate::models::ETH_TRANSFER_ADDR;
         let profit_eth = b.profit.iter()
             .find(|p| p.token == eth)
             .map(|p| p.amount.into_sign_and_abs().1)
             .expect("profit should include ETH");
         let profit_f = profit_eth.to::<u128>() as f64 / 1e18;
-        assert!(profit_f > 0.0 && profit_f < 0.01,
-            "profit should be tiny (executor self-funded, only the slippage), got {} ETH", profit_f);
-
-        // Hard ceiling: under 0.001 ETH. The pre-fix value was 0.025312 ETH,
-        // ~530× too high.
-        assert!(profit_f < 0.001,
-            "profit {} ETH exceeds the realistic ceiling of 0.001 ETH — over-counting regression?",
-            profit_f);
+        assert!(profit_f > 0.0 && profit_f < 0.001,
+            "profit should be tiny (executor self-funded, only slippage), got {} ETH", profit_f);
     }
 });
 

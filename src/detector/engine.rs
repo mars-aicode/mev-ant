@@ -9,7 +9,6 @@ use std::collections::{HashMap, HashSet};
 use alloy::primitives::{Address, B256, I256, U256};
 use tracing::debug;
 
-use crate::classifier::Classified;
 use crate::detector::funder::{FunderResolver, WETH};
 use crate::detector::Ctx;
 use crate::models::{PoolId, SandwichBundle, TokenDelta, Transfer, TxFlow, ETH_TRANSFER_ADDR};
@@ -35,7 +34,6 @@ pub(crate) struct ExecutorTrade {
 pub(crate) fn discover_executor_trades(
     ctx: &Ctx,
     flows: &[&TxFlow],
-    classified: &Classified,
 ) -> Vec<ExecutorTrade> {
     let mut trades: Vec<ExecutorTrade> = Vec::new();
 
@@ -48,10 +46,10 @@ pub(crate) fn discover_executor_trades(
             if !to_pool && !from_pool { continue; }
 
             let amt = i128_sat(t.amount);
-            if classified.unknown.contains(&t.from) {
+            if ctx.unknown.contains(&t.from) {
                 *exec_deltas.entry(t.from).or_default().entry(t.token).or_default() -= amt;
             }
-            if classified.unknown.contains(&t.to) {
+            if ctx.unknown.contains(&t.to) {
                 *exec_deltas.entry(t.to).or_default().entry(t.token).or_default() += amt;
             }
         }
@@ -62,7 +60,7 @@ pub(crate) fn discover_executor_trades(
             .cloned()
             .unwrap_or_default();
         if let Some(to) = flow.to {
-            if classified.unknown.contains(&to) && !known_exec.contains(&to) {
+            if ctx.unknown.contains(&to) && !known_exec.contains(&to) {
                 trades.push(ExecutorTrade {
                     tx_index: flow.tx_index, executor: to,
                     deltas: HashMap::new(), pools: tx_pool_set.clone(),
@@ -70,7 +68,7 @@ pub(crate) fn discover_executor_trades(
                 });
             }
         }
-        if classified.unknown.contains(&flow.from) && !known_exec.contains(&flow.from) {
+        if ctx.unknown.contains(&flow.from) && !known_exec.contains(&flow.from) {
             trades.push(ExecutorTrade {
                 tx_index: flow.tx_index, executor: flow.from,
                 deltas: HashMap::new(), pools: tx_pool_set,
